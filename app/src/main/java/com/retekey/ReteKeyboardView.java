@@ -1,0 +1,2462 @@
+package com.retekey;
+
+import android.annotation.SuppressLint;
+import android.content.Context;
+import android.content.SharedPreferences;
+import android.graphics.Bitmap;
+import android.graphics.Canvas;
+import android.graphics.Color;
+import android.graphics.Paint;
+import android.graphics.Path;
+import android.util.DisplayMetrics;
+import android.view.MotionEvent;
+import android.view.View;
+import android.view.ViewConfiguration;
+import java.util.EnumSet;
+import java.util.List;
+import java.util.Objects;
+import java.util.Set;
+
+@SuppressLint("ViewConstructor")
+public final class ReteKeyboardView extends View {
+    public interface InputSink {
+        void accept(ProjectKeyEvent event);
+    }
+
+    private static final String PREFS = "retekey_view";
+
+    private static final String KEY_LAST_LETTERS = "last_letter_layout";
+
+    /** The Tab key's stable id, which the hold latch paints and addresses its events to. */
+    private static final String TAB_KEY_ID = "touch.edit.tab";
+    private static final String CAPS_KEY_ID = "touch.key.capslock";
+    /** The space bar, which is drawn as a bar rather than labelled with a word. */
+    private static final String SPACE_KEY_ID = "touch.text.space";
+    /** The key that walks the letter layouts; it is captioned with the one it is showing. */
+    private static final String LAYOUT_TOGGLE_KEY_ID = "touch.layout.toggle";
+
+    private final Paint paint = new Paint(Paint.ANTI_ALIAS_FLAG);
+    private final InputSink sink;
+    private final KeyFeedback feedback;
+    private final LatchState shiftLayer = new LatchState();
+    /** Ctrl, Meta and Alt: tap to arm for one key, hold to lock. */
+    private final ModifierLatches modifierLatches = new ModifierLatches();
+    /**
+     * Whether Tab is currently latched down. Not an armed modifier: the editor has been sent Tab's
+     * down half and has not been sent the up, so as far as it knows a finger is still on the key.
+     */
+    private boolean tabHeld;
+    /**
+     * Whether Caps Lock is on, as far as this keyboard knows. The editor owns the real state; this is
+     * what the face shows, flipped on every tap of the key so the two stay in step from here.
+     */
+    private boolean capsLocked;
+    /**
+     * One finger, and the key it is holding. Typing with two thumbs means two of these at once, so
+     * each carries its own long-press and auto-repeat timers rather than sharing the view's.
+     */
+    private final class Touch {
+        final int pointerId;
+        final float downX;
+        final float downY;
+        // The grid this finger's indexes were taken from. Another finger can switch the page
+        // mid-press, and row/key would then point into a different keyboard.
+        final String grid;
+        // Not final: a finger that slides a slop clear of its key takes the key it slid onto.
+        int row;
+        int key;
+        // Which press this was, over the whole life of the view: settling types in press order,
+        // and the map is keyed by pointer id, which reuse can hand out in any order.
+        final int serial = nextTouchSerial++;
+        boolean holdConsumed;
+        boolean repeatFired;
+        /** The 천지인 direction guide is showing for this finger. */
+        boolean guideOpen;
+        /** Which way the finger has gone since the guide opened; null means it is still still. */
+        CheonjiinInterpreter.Flick guideDirection;
+        /** The strip of hold candidates this finger is choosing from, or null. */
+        HoldPicker picker;
+        /** Which candidate the finger is on while the strip is up. */
+        int pickerIndex;
+        /** Whether the finger has moved off its key since the strip came up. */
+        boolean pickerMoved;
+        /** A made-up candidate list for pictures (ScreenshotActivity); null in real use. */
+        List<String> pickerPreview;
+        /** A modifier this finger armed the moment it came down (§15.37), or null. */
+        ControlKey heldModifier;
+        /** What that modifier's latch held before this finger landed on it (review R11). */
+        LatchState.State latchBeforePress;
+        /** What {@link #typedCount} was then, so the lift can see whether a key used it. */
+        int typedAtDown;
+        final Runnable onHold = () -> handleLongPress(this);
+        final Runnable onRepeat = () -> handleRepeat(this);
+
+        Touch(int pointerId, int row, int key, String grid, float downX, float downY) {
+            this.pointerId = pointerId;
+            this.downX = downX;
+            this.downY = downY;
+            this.row = row;
+            this.key = key;
+            this.grid = grid;
+        }
+    }
+
+    private final android.util.SparseArray<Touch> touches = new android.util.SparseArray<>();
+    private int nextTouchSerial;
+    /** How many keystrokes have been sent; a held Shift reads it to see whether it was used. */
+    private int typedCount;
+    /** What the syllable being spelled expects next; the service keeps it up to date. */
+    private JamoExpectation.Kind expectedJamo = JamoExpectation.Kind.NONE;
+    // Held-key auto-repeat (space, enter, backspace, arrows, letters …), configured in settings.
+    private boolean repeatEnabled = KeyRepeatSettings.DEFAULT_ENABLED;
+    private int repeatDelayMs = KeyRepeatSettings.DEFAULT_DELAY_MS;
+    private int repeatIntervalMs = KeyRepeatSettings.DEFAULT_INTERVAL_MS;
+    // Held strongly so the weak listener registration in the preferences survives; it applies
+    // settings changes (feedback strengths, height) to a keyboard that is already on screen.
+    private final SharedPreferences.OnSharedPreferenceChangeListener prefsListener =
+        (changed, key) -> reloadPreferences();
+    private enum Page { LETTERS, SPECIAL_CHARS, SPECIAL_KEYS, MENU }
+
+    /** What the 12-key pages' own cells show: Hangul, digits, or the cursor cluster. */
+    private PhoneOverlay phoneOverlay = PhoneOverlay.NONE;
+    /** Whether a code point is being typed, in which case the keys are the hex pad. */
+    private boolean unicodeEntry;
+    /** What the pad's top strip reads: the digits so far and the character they name. */
+    private String unicodePreview = "U+";
+    /** A layout handed in whole for pictures (ScreenshotActivity's five-row proof); null in real use. */
+    private KeyboardLayout previewLayout;
+    /** Whether what is being echoed was chosen from a hold rather than typed by a plain press. */
+    private boolean flashFromChoice;
+    /** Whether the echo box is drawn at all, and how much of the keyboard shows through it. */
+    private boolean echoBoxEnabled = EchoBoxSettings.DEFAULT_ENABLED;
+    /** Nothing drawn for a moment and taken away: no flash, press shade or echo (issue #15). */
+    private boolean still;
+    private int echoBoxOpacity = EchoBoxSettings.DEFAULT_OPACITY;
+
+
+    /**
+     * How far a finger must go for a drag to be a drag. Kept small so the letter arrives at once —
+     * that is the whole reason to drag rather than tap twice — but above the touch slop so an
+     * ordinary press cannot become one by accident. It was 14 dp; taps whose fingertip slid 14–20
+     * dp — ordinary when typing fast — came out as flicked letters on 천지인 (emulator,
+     * 2026-09-16). A meant flick travels well past 18 dp on a key two columns wide.
+     */
+    private static final float FLICK_DP = 18.0f;
+
+    /** How far past a key's edge a finger drifts before the press becomes the neighbour's (dp). */
+    private static final float RETARGET_DP = 16.0f;
+    /** The shortest hold that types a key's alternate rather than its letter. */
+    private static final int ALTERNATE_HOLD_MS = 520;
+    /**
+     * How long a 12-key run waits before the next press of the same key starts a new letter rather
+     * than cycling. A phone does the same, and it is what lets 삶 be followed by ㅇ — the key that
+     * typed the ㅁ before it.
+     */
+    private static final int MULTI_TAP_TIMEOUT_MS = 800;
+
+    /** Gap (in dp) drawn around each key. Drawing only: the touch target is the whole cell, so
+     * the space between keys still belongs to a key. See TouchTargeting. */
+    private static final float KEY_GAP_DP = 2.0f;
+    private static final float KEY_RADIUS_DP = 5.0f;
+    private static final float KEY_SHADOW_DP = 2.0f;
+
+    /** {@link #KEY_GAP_DP} resolved to pixels for this display; set in the constructor. */
+    private final int keyGapPx;
+    /** How far a finger may wander before it is judged to have left its key. */
+    private final int touchSlopPx;
+    private final int flickDistancePx;
+    /**
+     * How far past a key's edge a finger has to travel before the press becomes the neighbour's.
+     *
+     * <p>The system's touch slop is the distance at which a press stops being a tap, which is not
+     * the same question: a fast tap rolls a few millimetres as the finger lands and lifts, and at
+     * the slop distance that roll was handing the press to the key below — ⌫ typed a space, space
+     * sent Enter (owner's report, 2026-09-16). Sliding to a neighbour on purpose is a deliberate
+     * movement and still works; it just has to mean it.
+     */
+    private final int retargetPx;
+    private final int keyRadiusPx;
+    private final int keyShadowPx;
+
+    private KeyboardLayoutId letterLayoutId = KeyboardLayoutId.KO_DUBEOLSIK;
+    /** Whether the editor now focused takes numbers, in which case the keypad is what is shown. */
+    private boolean numericField;
+    private Page page = Page.LETTERS;
+    private NumpadMode numpadMode = NumpadMode.NUMBERS;
+
+    /** Invoked when the 설정 tile is tapped; the host service opens the settings screen. */
+    private Runnable onOpenSettings;
+    /** Invoked with an editor context-menu id (copy/paste/undo) for the host to perform. */
+    private Fn.IntConsumer onEditCommand;
+    /** Invoked when the 날짜 tile is tapped; the host inserts the current date and time. */
+    private Runnable onInsertDate;
+    /** Invoked when the 키보드전환 tile is tapped; the host opens the input-method picker. */
+    private Runnable onSwitchIme;
+    /** Invoked when the 키보드관리 tile is tapped; the host opens the enable-keyboards screen. */
+    private Runnable onManageIme;
+    /** Invoked when the 한자 key is tapped; the host converts the reading to Hanja. */
+    private Runnable onHanja;
+    private Runnable onUnicodeInput;
+    private Runnable onNotepad;
+    private Runnable onClipboard;
+    private Runnable onIpaFind;
+    private Runnable onIpaChart;
+    private Runnable onFloatingToggle;
+    private Runnable onThemeCycle;
+    private Runnable onKanaModifier;
+    private Fn.Consumer<KeyboardLayoutId> onLayoutChanged;
+    private final CheonjiinInterpreter cheonjiin = new CheonjiinInterpreter();
+    private final NaratgeulInterpreter naratgeul = new NaratgeulInterpreter();
+    /** Ends the 12-key multi-tap grouping after a pause, without ending the syllable. */
+    private final Runnable endMultiTap = () -> {
+        cheonjiin.endMultiTap();
+        endCycleRun();
+    };
+    /** The cycling key a run of taps is currently inside, and how far through it that run is. */
+    private String cycleKeyId;
+    private int cycleIndex = -1;
+    /** User-adjustable multiplier on the base keyboard height, persisted across sessions. */
+    private static final long FLASH_MS = 180;
+    private static final float FLASH_MAX_ALPHA = 150.0f;
+    private boolean flashing;
+    private String flashLabel;
+    private final Runnable onFlashElapsed = () -> {
+        flashing = false;
+        flashLabel = null;
+        invalidate();
+    };
+    /**
+     * The height multiplier for the orientation being drawn. NaN until it is first needed: the
+     * default depends on the screen and on how many rows the layout has, neither of which the
+     * constructor can ask for safely.
+     */
+    /** The height in percent of the screen; 0 until the first read resolves it. */
+    private int heightPercent;
+    /** Visible horizontal key width as a percentage of its grid cell. */
+    private int keyWidthPercent = KeyWidthSettings.DEFAULT_PERCENT;
+    // The unpressed keyboard is rendered once into this bitmap and reused until the layout changes.
+    private Bitmap baseBitmap;
+    private String baseSignature;
+    // Colours resolved to the current light/dark (and Material You) theme; refreshed on rebuild.
+    private KeyboardPalette palette;
+
+    public ReteKeyboardView(Context context, InputSink sink) {
+        super(context);
+        this.sink = Objects.requireNonNull(sink, "sink");
+        float density = context.getResources().getDisplayMetrics().density;
+        this.keyGapPx = Math.round(KEY_GAP_DP * density);
+        this.touchSlopPx = ViewConfiguration.get(context).getScaledTouchSlop();
+        this.flickDistancePx = Math.max(touchSlopPx, Math.round(FLICK_DP * density));
+        this.retargetPx = Math.max(touchSlopPx, Math.round(RETARGET_DP * density));
+        this.keyRadiusPx = Math.round(KEY_RADIUS_DP * density);
+        this.keyShadowPx = Math.round(KEY_SHADOW_DP * density);
+        this.palette = KeyboardPalette.resolve(context);
+        setFocusable(true);
+        setFocusableInTouchMode(true);
+        setClickable(true);
+        feedback = new KeyFeedback(context);
+        feedback.reload(prefs());
+        letterLayoutId = restoreLetterLayout();
+    }
+
+    /** Sets the handler the 설정 tile runs to open settings; the service owns the launch. */
+    public void setOnOpenSettings(Runnable handler) {
+        this.onOpenSettings = handler;
+    }
+
+    /** Sets the handler for editor context-menu commands (copy/paste/undo) from menu tiles. */
+    public void setOnEditCommand(Fn.IntConsumer handler) {
+        this.onEditCommand = handler;
+    }
+
+    /** Sets the handler the 날짜 tile runs to insert the current date and time. */
+    public void setOnInsertDate(Runnable handler) {
+        this.onInsertDate = handler;
+    }
+
+    /** Sets the handler the 키보드전환 tile runs to open the input-method picker. */
+    public void setOnSwitchIme(Runnable handler) {
+        this.onSwitchIme = handler;
+    }
+
+    /** Sets the handler the 키보드관리 tile runs to open the enable-keyboards settings screen. */
+    public void setOnManageIme(Runnable handler) {
+        this.onManageIme = handler;
+    }
+
+    /** Sets the handler the 한자 key runs to convert the reading before the cursor to Hanja. */
+    public void setOnHanja(Runnable handler) {
+        this.onHanja = handler;
+    }
+
+    public void setOnKanaModifier(Runnable handler) {
+        this.onKanaModifier = handler;
+    }
+
+    public void setOnThemeCycle(Runnable handler) {
+        this.onThemeCycle = handler;
+    }
+
+    public void setOnFloatingToggle(Runnable handler) {
+        this.onFloatingToggle = handler;
+    }
+
+    /** Told which letter layout the globe key moved to, so the host can name it on screen. */
+    public void setOnLayoutChanged(Fn.Consumer<KeyboardLayoutId> handler) {
+        this.onLayoutChanged = handler;
+    }
+
+    /** The letter layout in use — what the letter keys type, whichever page is showing. */
+    public KeyboardLayoutId letterLayoutId() {
+        return letterLayoutId;
+    }
+
+    /** The layouts the globe key walks, as the user ordered them in settings. */
+    private java.util.List<KeyboardLayoutId> letterOrder() {
+        return LetterLayouts.parse(
+            OrientedPrefs.getString(prefs(), LetterLayouts.KEY_ORDER, orientation(), null));
+    }
+
+    /**
+     * Opens on the keypad for a field that takes numbers, and returns to the user's own layout for
+     * the next field that does not. Nothing is stored: this is what the editor asked for, not a
+     * choice the user made, and it must not survive the field it was made for.
+     */
+    public void setNumericField(boolean numeric) {
+        if (numeric == numericField) {
+            // Nothing to do, and nothing to disturb: moving between two ordinary fields must not
+            // put the user back on the letters page they had left on purpose.
+            return;
+        }
+        numericField = numeric;
+        letterLayoutId = numeric ? KeyboardLayoutId.PAD_KEYPAD : restoreLetterLayout();
+        page = Page.LETTERS;
+        phoneOverlay = PhoneOverlay.NONE;
+        shiftLayer.clear();
+        requestLayout();
+        invalidate();
+    }
+
+    /**
+     * What the composer is in the middle of, so a touch on the line between a consonant key and a
+     * vowel key can be settled by what can actually follow (TouchTargets).
+     */
+    public void setExpectedJamo(JamoExpectation.Kind expected) {
+        expectedJamo = expected == null ? JamoExpectation.Kind.NONE : expected;
+    }
+
+    /** Re-reads the layout order and lands on a layout that is still enabled. */
+    public void reloadLetterLayouts() {
+        java.util.List<KeyboardLayoutId> order = letterOrder();
+        if (!order.contains(letterLayoutId)) {
+            letterLayoutId = LetterLayouts.firstOf(order);
+        }
+        // The page is being rebuilt under whatever fingers are on it: the key one of them is
+        // holding may not be there afterwards. Their timers go, and a modifier one of them armed
+        // is taken back rather than left for the next page (review R11/W6).
+        cancelAllTouches();
+        requestLayout();
+        invalidate();
+    }
+
+    /** The layout the globe key was last left on, when it is still one the user enabled. */
+    private KeyboardLayoutId restoreLetterLayout() {
+        java.util.List<KeyboardLayoutId> order = letterOrder();
+        String stored = prefs().getString(KEY_LAST_LETTERS, null);
+        if (stored != null) {
+            for (KeyboardLayoutId id : order) {
+                if (id.name().equals(stored)) {
+                    return id;
+                }
+            }
+        }
+        return LetterLayouts.firstOf(order);
+    }
+
+    private SharedPreferences prefs() {
+        return getContext().getSharedPreferences(PREFS, Context.MODE_PRIVATE);
+    }
+
+    /** The height of the screen as it is being held now — what the percentage is a percentage of. */
+    private int screenHeightPx() {
+        DisplayMetrics metrics = getResources().getDisplayMetrics();
+        return KeyboardHeightPrefs.screenHeightPx(orientation(), metrics);
+    }
+
+    /** The height in use, resolving it from preferences the first time anything asks. */
+    private int heightPercent() {
+        if (heightPercent <= 0) {
+            DisplayMetrics metrics = getResources().getDisplayMetrics();
+            heightPercent = KeyboardHeightPrefs.percent(
+                prefs(),
+                orientation(),
+                screenHeightPx(),
+                Math.max(metrics.widthPixels, metrics.heightPixels),
+                metrics.density);
+        }
+        return heightPercent;
+    }
+
+    /** The current height, as a percentage of the screen. */
+    public int keyboardHeightPercent() {
+        return heightPercent();
+    }
+
+    /** Sets the height in percent of the screen, clamps it, optionally persists it, re-lays out. */
+    public void setKeyboardHeightPercent(int percent, boolean persist) {
+        int clamped = KeyboardHeightPercent.clamp(percent);
+        if (clamped == heightPercent() && !persist) {
+            return;
+        }
+        heightPercent = clamped;
+        if (persist) {
+            KeyboardHeightPrefs.setPercent(prefs(), orientation(), clamped);
+        }
+        requestLayout();
+        invalidate();
+    }
+
+    /** The height the keyboard asks for on its own: the height setting's share of the screen. */
+    int desiredHeightPx() {
+        return KeyboardHeightPercent.heightPx(heightPercent(), screenHeightPx());
+    }
+
+    @Override
+    protected void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {
+        int width = MeasureSpec.getSize(widthMeasureSpec);
+        int desired = desiredHeightPx();
+        int height;
+        switch (MeasureSpec.getMode(heightMeasureSpec)) {
+            case MeasureSpec.EXACTLY:
+                height = MeasureSpec.getSize(heightMeasureSpec);
+                break;
+            case MeasureSpec.AT_MOST:
+                height = Math.min(desired, MeasureSpec.getSize(heightMeasureSpec));
+                break;
+            default:
+                height = desired;
+                break;
+        }
+        setMeasuredDimension(width, height);
+    }
+
+    /** The layout currently drawn and hit-tested, including layer, shift, and keypad mode. */
+    public KeyboardLayout layout() {
+        if (previewLayout != null) {
+            return previewLayout;
+        }
+        if (unicodeEntry) {
+            // While a code point is being typed the keys are the digits it is made of; anything
+            // else would be a key that cannot be pressed for the thing on screen.
+            return KeyboardLayouts.unicodeEntry();
+        }
+        switch (page) {
+            case SPECIAL_CHARS:
+                return KeyboardLayouts.specialChars();
+            case SPECIAL_KEYS:
+                return KeyboardLayouts.specialKeys(numpadMode);
+            case MENU:
+                return KeyboardLayouts.menu();
+            default:
+                if (phoneOverlay != PhoneOverlay.NONE
+                    && (letterLayoutId == KeyboardLayoutId.KO_CHEONJIIN
+                        || letterLayoutId == KeyboardLayoutId.KO_NARATGEUL
+                        || letterLayoutId == KeyboardLayoutId.JA_FLICK)) {
+                    return KeyboardLayouts.phone(
+                        letterLayoutId, phoneOverlay, shiftLayer.isActive());
+                }
+                return KeyboardLayouts.of(letterLayoutId, shiftLayer.isActive());
+        }
+    }
+
+    /** Left/right visual edges for the width slider. Hit testing still uses the full cell. */
+    private float keyLeft(float left, float right) {
+        float inset = (right - left) * (100 - keyWidthPercent) / 200.0f;
+        return left + inset;
+    }
+
+    private float keyRight(float left, float right) {
+        float inset = (right - left) * (100 - keyWidthPercent) / 200.0f;
+        return right - inset;
+    }
+
+    @Override
+    protected void onAttachedToWindow() {
+        super.onAttachedToWindow();
+        prefs().registerOnSharedPreferenceChangeListener(prefsListener);
+        reloadPreferences();
+    }
+
+    @Override
+    protected void onDetachedFromWindow() {
+        prefs().unregisterOnSharedPreferenceChangeListener(prefsListener);
+        if (baseBitmap != null) {
+            baseBitmap.recycle();
+            baseBitmap = null;
+        }
+        feedback.release();
+        super.onDetachedFromWindow();
+    }
+
+    /** Applies persisted settings (feedback strengths and height) to the on-screen keyboard. */
+    private void reloadPreferences() {
+        feedback.reload(prefs());
+        repeatEnabled = prefs().getBoolean(
+            KeyRepeatSettings.KEY_ENABLED, KeyRepeatSettings.DEFAULT_ENABLED);
+        echoBoxEnabled = prefs().getBoolean(
+            EchoBoxSettings.KEY_ENABLED, EchoBoxSettings.DEFAULT_ENABLED);
+        echoBoxOpacity = EchoBoxSettings.clampOpacity(prefs().getInt(
+            EchoBoxSettings.KEY_OPACITY, EchoBoxSettings.DEFAULT_OPACITY));
+        still = ScreenTheme.still(getContext());
+        int newKeyWidthPercent = KeyWidthSettings.percent(prefs(), orientation());
+        if (newKeyWidthPercent != keyWidthPercent) {
+            keyWidthPercent = newKeyWidthPercent;
+            if (baseBitmap != null) { baseBitmap.recycle(); baseBitmap = null; }
+            baseSignature = null;
+        }
+        repeatDelayMs = KeyRepeatSettings.clampDelay(prefs().getInt(
+            KeyRepeatSettings.KEY_DELAY_MS, KeyRepeatSettings.DEFAULT_DELAY_MS));
+        repeatIntervalMs = KeyRepeatSettings.clampInterval(prefs().getInt(
+            KeyRepeatSettings.KEY_INTERVAL_MS, KeyRepeatSettings.DEFAULT_INTERVAL_MS));
+        // Read the key this orientation actually writes. Reading the un-suffixed one meant every
+        // preference change — including the height's own write — put the height back to default,
+        // which is why neither the size keys nor the settings slider appeared to do anything.
+        DisplayMetrics metrics = getResources().getDisplayMetrics();
+        int stored = KeyboardHeightPrefs.percent(
+            prefs(),
+            orientation(),
+            screenHeightPx(),
+            Math.max(metrics.widthPixels, metrics.heightPixels),
+            metrics.density);
+        if (stored != heightPercent()) {
+            heightPercent = stored;
+            requestLayout();
+        }
+        invalidate();
+    }
+
+    /** A bar tap on a modifier: arm it for one key (or cancel an arming / clear a lock). */
+    public void tapModifierFromBar(ControlKey control) {
+        if (!ModifierLatches.handles(control)) {
+            return;
+        }
+        modifierLatches.tap(control);
+        invalidate();
+    }
+
+    public void setModifierLockFromBar(ControlKey control, boolean down) {
+        if (control == ControlKey.SHIFT) {
+            // Shift is the layout's own latch rather than one of the three, so a bar slot holding
+            // it locks the same state the Shift key does.
+            if (shiftLayer.isLocked() != down) {
+                shiftLayer.toggleLock();
+                invalidate();
+            }
+            return;
+        }
+        if (!ModifierLatches.handles(control) || modifierLatches.isLocked(control) == down) {
+            return;
+        }
+        modifierLatches.hold(control);
+        invalidate();
+    }
+
+    /** Clears transient one-shot and pointer state when the editor session changes. */
+    public void resetLayerState() {
+        shiftLayer.clear();
+        modifierLatches.clear();
+        releaseTabHoldIfLatched();
+        cancelAllTouches();
+        feedback.reload(prefs());
+        invalidate();
+    }
+
+    /**
+     * Flashes the whole keyboard for a moment so a keystroke is visible at the panel level, not
+     * only on the one key under the finger. Follows the visual-feedback strength setting, so
+     * turning that to zero turns the blink off with it.
+     */
+    private void flashKeyboard(SoftwareKeySpec key, String typed) {
+        flashKeyboard(key, typed, false);
+    }
+
+    /**
+     * The same, for a character that was <em>chosen</em> — held for, flicked to, picked off a
+     * strip. It is echoed in the choosing colour rather than the pressing one, so a hold that
+     * lands on the wrong alternate is visible as such at a glance (owner's request, 2026-09-18).
+     */
+    private void flashChoice(SoftwareKeySpec key, String typed) {
+        flashKeyboard(key, typed, true);
+    }
+
+    private void flashKeyboard(SoftwareKeySpec key, String typed, boolean chosen) {
+        if (feedback.visualIntensity() <= 0.0f || still) {
+            return;
+        }
+        removeCallbacks(onFlashElapsed);
+        flashing = true;
+        flashFromChoice = chosen;
+        flashLabel = echoLabel(key, typed);
+        invalidate();
+        postDelayed(onFlashElapsed, FLASH_MS);
+    }
+
+    /**
+     * What the echo box should show, or {@code null} for keys that type nothing to echo — the
+     * layer switches, the modifiers, backspace, enter. Their own label would say nothing useful
+     * blown up to the size of a syllable.
+     */
+    static String echoLabel(SoftwareKeySpec key, String typed) {
+        if (typed != null) {
+            return typed;
+        }
+        if (key == null || key.isControl() || !key.enabled()) {
+            return null;
+        }
+        SemanticInput input = key.semanticInput();
+        if (input == null) {
+            return null;
+        }
+        switch (input.kind()) {
+            case TEXT:
+            case JAMO:
+                return key.label();
+            default:
+                return null;
+        }
+    }
+
+    @Override
+    protected void onDraw(Canvas canvas) {
+        super.onDraw(canvas);
+        int width = getWidth();
+        int height = getHeight();
+        if (width <= 0 || height <= 0) {
+            return;
+        }
+        // The unpressed keyboard (raised keys and labels) is cached to a bitmap and only rebuilt
+        // when the layout, highlight state, or size changes; a key press just tints one key.
+        ensureBaseBitmap(width, height);
+        canvas.drawBitmap(baseBitmap, 0.0f, 0.0f, null);
+        drawPressFeedback(canvas, width, height);
+        drawFlickGuides(canvas, width, height);
+        drawHoldPickers(canvas, width, height);
+        drawFlash(canvas, width, height);
+        drawEchoBox(canvas, width, height);
+    }
+
+    /**
+     * The keystroke blink: the gaps between the keys light up, and the keys themselves do not, so
+     * the grid flashes as a lattice around what you are reading rather than washing over it.
+     */
+    private void drawFlash(Canvas canvas, int width, int height) {
+        if (!flashing) {
+            return;
+        }
+        int tint = palette.keyAccent;
+        paint.setColor(Color.argb(
+            Math.round(feedback.visualIntensity() * FLASH_MAX_ALPHA),
+            Color.red(tint), Color.green(tint), Color.blue(tint)));
+        KeyboardLayout layout = layout();
+        List<List<SoftwareKeySpec>> rows = layout.rows();
+        int saved = canvas.save();
+        for (int rowIndex = 0; rowIndex < rows.size(); rowIndex++) {
+            List<SoftwareKeySpec> keys = rows.get(rowIndex);
+            int top = layout.rowEdge(rowIndex, height);
+            int bottom = layout.rowEdge(rowIndex + 1, height);
+            for (int keyIndex = 0; keyIndex < keys.size(); keyIndex++) {
+                SoftwareKeySpec key = keys.get(keyIndex);
+                int startColumn = layout.startColumn(rowIndex, keyIndex);
+                int left = layout.columnEdge(startColumn, width);
+                int right = layout.columnEdge(startColumn + key.columnSpan(), width);
+                // Cut each key face out of the wash; what is left is exactly the gaps.
+                Compat.clipOut(canvas,
+                    keyLeft(left, right), top + keyGapPx, keyRight(left, right), bottom - keyGapPx);
+            }
+        }
+        canvas.drawRect(0.0f, 0.0f, width, height, paint);
+        canvas.restoreToCount(saved);
+    }
+
+    /**
+     * Shows the character that was just typed, large and in a box over the keyboard, for as long as
+     * the blink lasts. A finger covers the key it pressed; this puts the result somewhere it can
+     * actually be read.
+     */
+    private void drawEchoBox(Canvas canvas, int width, int height) {
+        if (!flashing || flashLabel == null || !echoBoxEnabled) {
+            return;
+        }
+        float boxHeight = Math.min(height * 0.38f, dp(72));
+        float textSize = boxHeight * 0.62f;
+        paint.setTextSize(textSize);
+        paint.setTextAlign(Paint.Align.CENTER);
+        float boxWidth = Math.max(boxHeight, paint.measureText(flashLabel) + dp(28));
+        float centerX = width * 0.5f;
+        // Along the top edge, away from the rows the hand is usually over.
+        float top = dp(6);
+        float left = centerX - boxWidth * 0.5f;
+        float radius = dp(10);
+
+        int face = flashFromChoice ? palette.choiceAccent : palette.keyAccent;
+        paint.setColor(EchoBoxSettings.withOpacity(face, echoBoxOpacity));
+        Compat.drawRoundRect(
+            canvas, left, top, left + boxWidth, top + boxHeight, radius, paint);
+        paint.setColor(EchoBoxSettings.inkWithOpacity(palette.inkOn(face), echoBoxOpacity));
+        canvas.drawText(
+            flashLabel, centerX, top + boxHeight * 0.5f - (paint.descent() + paint.ascent()) / 2.0f,
+            paint);
+    }
+
+    /** Which way the device is held; the height and the layouts on offer depend on it. */
+    private ScreenOrientation orientation() {
+        return OrientedPrefs.current(getContext());
+    }
+
+    private int dp(int value) {
+        return Math.round(value * getResources().getDisplayMetrics().density);
+    }
+
+    /** Tints each held key for a colour-change press feedback, one per finger on the keyboard. */
+    private void drawPressFeedback(Canvas canvas, int width, int height) {
+        if (touches.size() == 0 || feedback.visualIntensity() <= 0.0f || still) {
+            return;
+        }
+        KeyboardLayout layout = layout();
+        for (int i = 0; i < touches.size(); i++) {
+            Touch touch = touches.valueAt(i);
+            if (touch.row >= layout.rows().size()) {
+                continue;
+            }
+            List<SoftwareKeySpec> row = layout.rows().get(touch.row);
+            if (touch.key >= row.size()) {
+                continue;
+            }
+            SoftwareKeySpec key = row.get(touch.key);
+            int top = layout.rowEdge(touch.row, height);
+            int bottom = layout.rowEdge(touch.row + 1, height);
+            int startColumn = layout.startColumn(touch.row, touch.key);
+            int left = layout.columnEdge(startColumn, width);
+            int right = layout.columnEdge(startColumn + key.columnSpan(), width);
+            // Redraw the whole key in its pressed shade: the face lifts toward white and a little
+            // toward the accent, and the label is painted again on top of it, so the key reads as
+            // brighter rather than as covered over.
+            drawKey(canvas, key, left, top, right, bottom,
+                KeyPressTint.pressed(keyFillColor(key), palette.pressTint));
+        }
+    }
+
+    /**
+     * The guide a held 천지인 key raises: the four letters around it and, in the middle, the digit
+     * it holds. The way the finger has gone is lit, so what will be typed on release is the one
+     * under it — and a quick drag shows the same thing with its choice already made.
+     */
+    private void drawFlickGuides(Canvas canvas, int width, int height) {
+        KeyboardLayout layout = layout();
+        for (int i = 0; i < touches.size(); i++) {
+            Touch touch = touches.valueAt(i);
+            if (!touch.guideOpen || touch.row >= layout.rows().size()) {
+                continue;
+            }
+            List<SoftwareKeySpec> row = layout.rows().get(touch.row);
+            if (touch.key >= row.size()) {
+                continue;
+            }
+            SoftwareKeySpec key = row.get(touch.key);
+            CheonjiinInterpreter.Key phoneKey = phoneKeyOf(key);
+            KanaFlick.Key kanaKey = KanaFlick.of(key);
+            if (phoneKey == null && kanaKey == null && !key.hasFlicks()) {
+                continue;
+            }
+            int startColumn = layout.startColumn(touch.row, touch.key);
+            float cellLeft = layout.columnEdge(startColumn, width);
+            float cellRight = layout.columnEdge(startColumn + key.columnSpan(), width);
+            float cellTop = layout.rowEdge(touch.row, height);
+            float cellBottom = layout.rowEdge(touch.row + 1, height);
+            float box = Math.min(cellRight - cellLeft, cellBottom - cellTop) * 0.78f;
+            float step = box * 1.04f;
+            // Centred on the key, then nudged back inside the keyboard when it would hang off.
+            float centreX = Math.min(Math.max((cellLeft + cellRight) * 0.5f, step + box * 0.5f),
+                width - step - box * 0.5f);
+            float centreY = Math.min(Math.max((cellTop + cellBottom) * 0.5f, step + box * 0.5f),
+                height - step - box * 0.5f);
+
+            drawGuideCell(canvas, centreX, centreY, box,
+                key.hasLongPress() ? key.longPressTexts().get(0) : null,
+                touch.guideDirection == null);
+            drawGuideCell(canvas, centreX - step, centreY, box,
+                guideLabel(key, phoneKey, kanaKey, CheonjiinInterpreter.Flick.LEFT),
+                touch.guideDirection == CheonjiinInterpreter.Flick.LEFT);
+            drawGuideCell(canvas, centreX + step, centreY, box,
+                guideLabel(key, phoneKey, kanaKey, CheonjiinInterpreter.Flick.RIGHT),
+                touch.guideDirection == CheonjiinInterpreter.Flick.RIGHT);
+            drawGuideCell(canvas, centreX, centreY - step, box,
+                guideLabel(key, phoneKey, kanaKey, CheonjiinInterpreter.Flick.UP),
+                touch.guideDirection == CheonjiinInterpreter.Flick.UP);
+            drawGuideCell(canvas, centreX, centreY + step, box,
+                guideLabel(key, phoneKey, kanaKey, CheonjiinInterpreter.Flick.DOWN),
+                touch.guideDirection == CheonjiinInterpreter.Flick.DOWN);
+        }
+    }
+
+    /**
+     * The strip a held key with several alternates raises — see {@link HoldPicker} for where it
+     * goes. Each candidate is drawn in its own column on the strip's row, the one under the finger
+     * lit; the strip is painted over the keys there, the way the 천지인 guide is.
+     */
+    private void drawHoldPickers(Canvas canvas, int width, int height) {
+        KeyboardLayout layout = layout();
+        for (int i = 0; i < touches.size(); i++) {
+            Touch touch = touches.valueAt(i);
+            HoldPicker picker = touch.picker;
+            if (picker == null || touch.row >= layout.rows().size()) {
+                continue;
+            }
+            List<SoftwareKeySpec> row = layout.rows().get(touch.row);
+            if (touch.key >= row.size()) {
+                continue;
+            }
+            List<String> candidates = pickerCandidates(touch, row.get(touch.key));
+            float cellTop = layout.rowEdge(picker.stripRow, height);
+            float cellBottom = layout.rowEdge(picker.stripRow + 1, height);
+            for (int index = 0; index < picker.count && index < candidates.size(); index++) {
+                int column = picker.columnOf(index);
+                float cellLeft = layout.columnEdge(column, width);
+                float cellRight = layout.columnEdge(column + 1, width);
+                float box = Math.min(cellRight - cellLeft, cellBottom - cellTop) * 0.92f;
+                drawGuideCell(canvas, (cellLeft + cellRight) * 0.5f, (cellTop + cellBottom) * 0.5f,
+                    box, candidates.get(index), index == touch.pickerIndex);
+            }
+        }
+    }
+
+    /** What a finger's strip offers: the key's alternates, or the preview's made-up list. */
+    private List<String> pickerCandidates(Touch touch, SoftwareKeySpec key) {
+        return touch.pickerPreview != null ? touch.pickerPreview : key.longPressTexts();
+    }
+
+    /** What a guide cell shows for whichever kind of flicking key is held. */
+    private static String guideLabel(SoftwareKeySpec key, CheonjiinInterpreter.Key phoneKey,
+            KanaFlick.Key kanaKey, CheonjiinInterpreter.Flick direction) {
+        if (key.hasFlicks()) {
+            return visibleFlickText(key.flickText(direction));
+        }
+        if (kanaKey != null) {
+            return KanaFlick.flick(kanaKey, direction);
+        }
+        return CheonjiinInterpreter.flickLabel(phoneKey, direction);
+    }
+
+    private void drawGuideCell(
+            Canvas canvas, float centreX, float centreY, float box, String label, boolean aimed) {
+        if (label == null) {
+            return;
+        }
+        float half = box * 0.5f;
+        float radius = box * 0.18f;
+        // Choosing has its own colour: the one under the finger in it, the rest tinted with it,
+        // so the strip reads as a choice being made rather than as more pressed keys.
+        int fill = aimed
+            ? palette.choiceAccent
+            : palette.outlined
+                ? palette.keyFace
+                : ChoiceHue.softOf(palette.keyAccent, palette.keyFace);
+        drawKeyShape(canvas, centreX - half, centreY - half, centreX + half, centreY + half,
+            radius, fill);
+        paint.setColor(palette.inkOn(fill));
+        paint.setTextAlign(Paint.Align.CENTER);
+        paint.setTextSize(box * 0.5f);
+        canvas.drawText(directionForDisplay(label), centreX,
+            centreY - (paint.descent() + paint.ascent()) / 2.0f, paint);
+    }
+
+    private void ensureBaseBitmap(int width, int height) {
+        String signature = layoutSignature();
+        if (baseBitmap != null && signature.equals(baseSignature)
+            && baseBitmap.getWidth() == width && baseBitmap.getHeight() == height) {
+            return;
+        }
+        if (baseBitmap != null) {
+            baseBitmap.recycle();
+        }
+        // The cached keyboard is opaque — it starts with a solid background fill — so it needs no
+        // alpha channel, and RGB_565 halves what the cache costs. On a tablet that is megabytes.
+        baseBitmap = Bitmap.createBitmap(width, height, Bitmap.Config.RGB_565);
+        palette = KeyboardPalette.resolve(getContext());
+        Canvas cache = new Canvas(baseBitmap);
+        cache.drawColor(palette.background);
+        paint.setTextAlign(Paint.Align.CENTER);
+        KeyboardLayout layout = layout();
+        List<List<SoftwareKeySpec>> rows = layout.rows();
+        for (int rowIndex = 0; rowIndex < rows.size(); rowIndex++) {
+            List<SoftwareKeySpec> keys = rows.get(rowIndex);
+            int top = layout.rowEdge(rowIndex, height);
+            int bottom = layout.rowEdge(rowIndex + 1, height);
+            for (int keyIndex = 0; keyIndex < keys.size(); keyIndex++) {
+                SoftwareKeySpec key = keys.get(keyIndex);
+                int startColumn = layout.startColumn(rowIndex, keyIndex);
+                int left = layout.columnEdge(startColumn, width);
+                int right = layout.columnEdge(startColumn + key.columnSpan(), width);
+                drawKey(cache, key, left, top, right, bottom);
+            }
+        }
+        baseSignature = signature;
+    }
+
+    /** Identifies what the cached bitmap depends on, so it is reused until one of these changes. */
+    private String layoutSignature() {
+        return page + "|" + letterLayoutId + "|" + nextLayoutCaption() + "|" + numpadMode
+            + "|" + phoneOverlay + "|" + unicodeEntry + "|" + unicodePreview
+            + "|" + shiftLayer.isActive()
+            + "|" + shiftLayer.isLocked() + "|" + modifierLatches.signature() + "|" + tabHeld
+            + "|" + capsLocked + "|"
+            + KeyboardPalette.isNight(getContext()) + "|" + ScreenTheme.mode(getContext())
+            + "|" + ScreenTheme.monochrome(getContext());
+    }
+
+    /**
+     * What the layout-walking key says: an arrow and the layout it would land you on. The layout
+     * in use is already legible on the keys themselves; what the key has to answer is "and if I
+     * press you?".
+     *
+     * <p>The answer is not the same on every page. From the letters the key walks to the next
+     * layout; from the symbols, keypad or menu pages the same key is the way back, and it returns
+     * the layout you left rather than advancing past it. Naming the next one there was a caption
+     * for a press that never happens — the key was right and the label was wrong.
+     */
+    private String nextLayoutCaption() {
+        KeyboardLayoutId destination = page == Page.LETTERS
+            ? LetterLayouts.next(letterOrder(), letterLayoutId)
+            : letterLayoutId;
+        // Every cap is three letters now, shown in bold capitals with no arrow (owner's choice,
+        // 2026-08-29) — the weight and the case are the arrow.
+        return LetterLayouts.keyCapName(destination).toUpperCase(java.util.Locale.ROOT);
+    }
+
+    /**
+     * A hint or guide character, shaped in the direction of the layout it sits on. The
+     * guillemets « » are bidi-mirrored characters: the glyph the user will *see in their text*
+     * depends on the text's direction, so the key cap must preview them in that same direction —
+     * an RTL layout's cap in an RTL context (the » that renders as « in Persian text shows « on
+     * the cap too), an LTR layout's in an LTR context (French « stays «). v0.1.148 pinned
+     * everything to LTR, which made the Persian caps show the opposite of what typing produces
+     * (issue #4, second report, 2026-08-31). The prefix mark is zero-width and display-only —
+     * the committed text is untouched.
+     */
+    private String directionForDisplay(String text) {
+        if (text == null || text.isEmpty()) {
+            return text;
+        }
+        return (rtlLayout(layout().id()) ? "\u200f" : "\u200e") + text;
+    }
+
+    /** The layouts that write right to left; their caps preview characters in that direction. */
+    private static boolean rtlLayout(KeyboardLayoutId id) {
+        switch (id) {
+            case FA_ISIRI:
+            case AR_101:
+            case UR_PHONETIC:
+            case HE_STANDARD:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    /** The text to paint for a key: its label, or a word when the device has no glyph for it. */
+    private String labelOf(SoftwareKeySpec key) {
+        if (KeyboardLayouts.UNICODE_DISPLAY_ID.equals(key.stableKeyId())) {
+            return unicodePreview;
+        }
+        if (LAYOUT_TOGGLE_KEY_ID.equals(key.stableKeyId())) {
+            return nextLayoutCaption();
+        }
+        return LegacyGlyphs.label(key.label(), android.os.Build.VERSION.SDK_INT);
+    }
+
+    /** Draws one raised, rounded key with its label and long-press hint into the cache canvas. */
+    private void drawKey(Canvas canvas, SoftwareKeySpec key,
+            int left, int top, int right, int bottom) {
+        drawKey(canvas, key, left, top, right, bottom, keyFillColor(key));
+    }
+
+    /**
+     * A key's body. Ordinarily a face raised on a darker lip just below it; in the monochrome
+     * palette an outline in the ink colour round a face in the paper colour, the way an e-reader
+     * draws its own keys — a lip needs a second shade, and E-Ink has few to spare.
+     */
+    private void drawKeyShape(Canvas canvas, float l, float t, float r, float b, float radius,
+            int fill) {
+        paint.setColor(palette.keyShadow);
+        if (palette.outlined) {
+            float edge = Math.max(1.0f, keyShadowPx * 0.5f);
+            Compat.drawRoundRect(canvas, l, t, r, b, radius, paint);
+            paint.setColor(fill);
+            Compat.drawRoundRect(canvas, l + edge, t + edge, r - edge, b - edge,
+                Math.max(0.0f, radius - edge), paint);
+            return;
+        }
+        Compat.drawRoundRect(canvas, l, t + keyShadowPx, r, b + keyShadowPx, radius, paint);
+        paint.setColor(fill);
+        Compat.drawRoundRect(canvas, l, t, r, b, radius, paint);
+    }
+
+    /**
+     * One key, in the given face colour. The colour is a parameter so a pressed key can be redrawn
+     * whole — face, label and corner mark — in its brighter shade, rather than washed over with a
+     * translucent sheet that takes the label down with it.
+     */
+    private void drawKey(Canvas canvas, SoftwareKeySpec key,
+            int left, int top, int right, int bottom, int fill) {
+        float l = keyLeft(left, right);
+        float t = top + keyGapPx;
+        float r = keyRight(left, right);
+        float b = bottom - keyGapPx;
+        drawKeyShape(canvas, l, t, r, b, keyRadiusPx, fill);
+        // The ink follows the fill, not the theme: a held key is painted strongly enough that the
+        // ordinary label colour would sink into it.
+        boolean latched = canBeHeld(key) && isHeld(key);
+        // The code-point strip is not a key you cannot press: it is the readout, and the one thing
+        // on that pad worth reading. Muting it the way an unusable key is muted hid it.
+        boolean readout = KeyboardLayouts.UNICODE_DISPLAY_ID.equals(key.stableKeyId());
+        int ink = latched
+            ? palette.keyLatchedInk()
+            : key.enabled() || key.isControl() || readout
+                ? palette.inkOn(fill)
+                : palette.keyTextMuted;
+        paint.setColor(ink);
+        if (SPACE_KEY_ID.equals(key.stableKeyId())) {
+            // The space bar says what it is by its shape, the way a space bar always has. A word
+            // there is both the longest label on the keyboard and the least necessary one.
+            drawSpaceMark(canvas, l, t, r, b);
+        } else {
+            String label = labelOf(key);
+            fitLabel(label, right - left, bottom - top);
+            float x = (left + right) * 0.5f;
+            float y = top + (bottom - top) * 0.62f;
+            boolean boldToggleCap = LAYOUT_TOGGLE_KEY_ID.equals(key.stableKeyId());
+            if (latched || boldToggleCap) {
+                // An outline around the label, in the face's own strong ink: a held key is the one
+                // state that has to carry across a glance, and the weight says so before the
+                // colour does. The layout key's three-letter cap borrows the weight in place of
+                // its dropped ">".
+                paint.setStyle(Paint.Style.STROKE);
+                paint.setStrokeWidth(Math.max(1.5f, (bottom - top) * 0.018f));
+                paint.setColor(palette.inkOn(fill));
+                canvas.drawText(label, x, y, paint);
+                paint.setStyle(Paint.Style.FILL);
+                paint.setColor(ink);
+            }
+            canvas.drawText(label, x, y, paint);
+        }
+        if (key.hasLongPress() || key.hasLongPressHint()) {
+            // What a long press reaches, in small text in the top-right of the key's own face:
+            // the alternate character for a key that types one, or a letter naming the page for a
+            // key that opens one. Inset from the face, not from the cell — drawn against the cell
+            // it sat on the very edge and read as if it had slipped out of the key. A key with
+            // several alternates shows its first — the one a still hold types — and a dot in the
+            // bottom-right corner saying there are more along the strip.
+            String corner = directionForDisplay(key.hasLongPressHint()
+                ? key.longPressHint()
+                : key.longPressTexts().get(0));
+            float hint = (bottom - top) * 0.20f;
+            float inset = hint * 0.45f;
+            paint.setColor(palette.hintOn(fill));
+            paint.setTextSize(hint);
+            paint.setTextAlign(Paint.Align.RIGHT);
+            canvas.drawText(corner, r - inset, t + inset + hint * 0.85f, paint);
+            paint.setTextAlign(Paint.Align.CENTER);
+            if (key.longPressTexts().size() > 1) {
+                canvas.drawCircle(r - keyRadiusPx, b - keyRadiusPx, 3.0f, paint);
+            }
+        } else if (canBeHeld(key)) {
+            // Nothing in the corner. Ctrl, Meta, Alt and Tab used to carry a ring that filled in
+            // when they latched; the face itself now says it — armed keys take the soft accent and
+            // held ones are drawn inverted — and a second mark saying the same thing was one mark
+            // too many. The branch stays so these keys do not fall through to the hold dot below:
+            // that they can be held is what the fill is already telling you.
+        } else if (key.hasLongPress() || key.hasLongPressControl()) {
+            paint.setColor(palette.hintOn(fill));
+            canvas.drawCircle(r - keyRadiusPx, t + keyRadiusPx, 3.0f, paint);
+        }
+    }
+
+    /**
+     * The space key's mark: the open box that has meant "one space" on printed listings and in
+     * type samples for as long as there have been either — a box with its top side missing. Drawn
+     * rather than typed, because the character for it (U+2423) is missing from the fonts on the
+     * older devices this keyboard is built to run on, and a key that draws nothing is worse than
+     * one that draws a word.
+     */
+    private void drawSpaceMark(Canvas canvas, float l, float t, float r, float b) {
+        float width = Math.min((r - l) * 0.30f, (b - t) * 0.62f);
+        float height = width * 0.52f;
+        float cx = (l + r) * 0.5f;
+        float cy = (t + b) * 0.5f;
+        float left = cx - width * 0.5f;
+        float right = cx + width * 0.5f;
+        float top = cy - height * 0.5f;
+        float bottom = cy + height * 0.5f;
+        float stroke = Math.max(2.0f, height * 0.16f);
+        Paint.Style style = paint.getStyle();
+        paint.setStyle(Paint.Style.STROKE);
+        paint.setStrokeWidth(stroke);
+        Path box = new Path();
+        box.moveTo(left, top);
+        box.lineTo(left, bottom);
+        box.lineTo(right, bottom);
+        box.lineTo(right, top);
+        canvas.drawPath(box, paint);
+        paint.setStyle(style);
+    }
+
+    /** Whether holding this key keeps it down: Shift, the three modifiers, and Tab. */
+    private static boolean canBeHeld(SoftwareKeySpec key) {
+        if (key.isControl()) {
+            return key.control() == ControlKey.SHIFT
+                || key.control() == ControlKey.CAPS_LOCK
+                || ModifierLatches.handles(key.control());
+        }
+        return TAB_KEY_ID.equals(key.stableKeyId());
+    }
+
+    /** Whether it is being held right now — locked, not merely armed for the next key. */
+    private boolean isHeld(SoftwareKeySpec key) {
+        if (!key.isControl()) {
+            return tabHeld;
+        }
+        if (key.control() == ControlKey.SHIFT) {
+            return shiftLayer.isLocked();
+        }
+        if (key.control() == ControlKey.CAPS_LOCK) {
+            return capsLocked;
+        }
+        return modifierLatches.isLocked(key.control());
+    }
+
+    /** Sizes {@link #paint} so {@code label} fits a cell of the given size, tracking cell size. */
+    private void fitLabel(String label, int cellWidth, int cellHeight) {
+        float cap = cellHeight * KeyLabelFit.HEIGHT_RATIO;
+        float minSize = 8.5f * getResources().getDisplayMetrics().density;
+        paint.setTextSize(cap);
+        float measured = paint.measureText(label);
+        float size = KeyLabelFit.fitSize(
+            measured, cap, cellWidth * KeyLabelFit.WIDTH_RATIO, minSize);
+        paint.setTextSize(size);
+    }
+
+    @Override
+    public boolean onTouchEvent(MotionEvent event) {
+        int index = event.getActionIndex();
+        switch (event.getActionMasked()) {
+            case MotionEvent.ACTION_DOWN:
+            case MotionEvent.ACTION_POINTER_DOWN:
+                // Every finger gets its own key. Typing fast rolls — the next finger lands before
+                // the last one lifts — and a keyboard that only hears the first and last pointer
+                // loses everything pressed in between.
+                beginTouch(event.getPointerId(index), event.getX(index), event.getY(index));
+                return true;
+            case MotionEvent.ACTION_UP:
+            case MotionEvent.ACTION_POINTER_UP:
+                endTouch(event.getPointerId(index), event.getX(index), event.getY(index));
+                return true;
+            case MotionEvent.ACTION_MOVE:
+                moveTouches(event);
+                return true;
+            case MotionEvent.ACTION_CANCEL:
+                cancelAllTouches();
+                return true;
+            default:
+                return true;
+        }
+    }
+
+    @Override
+    public boolean performClick() {
+        super.performClick();
+        return true;
+    }
+
+    /** Starts this finger on the key under it, with its own hold and repeat timers. */
+    private void beginTouch(int pointerId, float x, float y) {
+        // A new finger settles every letter still riding on an earlier one. Keys type on release
+        // so a fingertip can slide to its neighbour, but in a fast roll the fingers can lift out
+        // of press order — and the 12-key automata read 획추가-before-ㄱ as a stroke with nothing
+        // to act on, so the stroke is lost and the consonant lands plain. Typing the earlier key
+        // now fixes the order at the last moment it is still known. Control keys stay held: a
+        // modifier chord is two fingers down at once, and must remain one.
+        settlePendingTaps();
+        KeyboardLayout layout = layout();
+        int[] target = TouchTargets.resolve(layout, getWidth(), getHeight(), x, y, expectedJamo);
+        if (target == null) {
+            return;
+        }
+        int rowIndex = target[0];
+        int keyIndex = target[1];
+        // Every pixel of the keyboard belongs to a key. The gap drawn around each face is a gap in
+        // the picture only: a touch target with dead space between the keys throws away roughly a
+        // third of the area, and every tap that lands there is a keystroke the user has to repeat.
+        Touch touch = new Touch(pointerId, rowIndex, keyIndex, gridSignature(), x, y);
+        touches.put(pointerId, touch);
+        armModifierOnPress(touch, layout.rows().get(rowIndex).get(keyIndex));
+        // Give immediate press feedback: a haptic tick, a click sound, and a visual highlight.
+        feedback.playKeyDown();
+        invalidate();
+        armTimers(touch, layout.rows().get(rowIndex).get(keyIndex));
+    }
+
+    /**
+     * Shift and the Ctrl/Alt/Meta latches take effect the moment the finger lands, not when it
+     * lifts. Typing fast rolls one key into the next, and a Shift whose finger left after the
+     * letter's did typed the letter unshifted and then armed itself for the key after it: 빠가다
+     * came out as ㅂ까다 (§15.37).
+     */
+    private void armModifierOnPress(Touch touch, SoftwareKeySpec key) {
+        if (!key.isControl()) {
+            return;
+        }
+        ControlKey control = key.control();
+        if (control == ControlKey.SHIFT) {
+            touch.latchBeforePress = shiftLayer.state();
+            shiftLayer.tap();
+        } else if (ModifierLatches.handles(control)) {
+            touch.latchBeforePress = modifierLatches.stateOf(control);
+            modifierLatches.tap(control);
+        } else {
+            return;
+        }
+        touch.heldModifier = control;
+        touch.typedAtDown = typedCount;
+        invalidate();
+    }
+
+    /**
+     * The finger that armed a modifier has lifted. If a key was typed while it was down, that key
+     * used the modifier, so the one-shot is spent here rather than left for the next key.
+     */
+    private void releaseModifier(Touch touch) {
+        if (touch.heldModifier == null || typedCount == touch.typedAtDown) {
+            return;
+        }
+        if (touch.heldModifier == ControlKey.SHIFT) {
+            consumeOneShotShift();
+        } else {
+            consumeOneShotModifiers();
+        }
+    }
+
+    /** A finger's hold and repeat timers, armed for whichever key it is on now. */
+    private void armTimers(Touch touch, SoftwareKeySpec key) {
+        // Shift, and any key with a long press, react to a hold.
+        if (key.hasLongPress()
+            || key.hasLongPressControl()
+            || (key.isControl()
+                && (key.control() == ControlKey.SHIFT
+                    || ModifierLatches.handles(key.control())))) {
+            postDelayed(touch.onHold, holdDelayFor(key));
+        } else if (repeatEnabled && repeatsOnHold(key)) {
+            // Ordinary keys with no long press auto-repeat while held.
+            postDelayed(touch.onRepeat, repeatDelayMs);
+        }
+    }
+
+    /**
+     * How long a finger must stay for a hold to act. A key that types its alternate waits longer
+     * than the system's long press: at the platform's 400 ms, a fifth of the presses in a measured
+     * run of ordinary typing came out as the alternate instead of the letter (§15.38). The keys
+     * that switch a state — Shift, the modifiers — keep the system's own timing, because there
+     * nothing is typed by mistake.
+     */
+    private int holdDelayFor(SoftwareKeySpec key) {
+        int system = ViewConfiguration.getLongPressTimeout();
+        return key.hasLongPress() ? Math.max(system, ALTERNATE_HOLD_MS) : system;
+    }
+
+    /**
+     * A finger has moved. It keeps the key it started on until it is a touch slop clear of that
+     * key's cell, and then takes the key it moved onto. A press therefore survives the roll of a
+     * fingertip — which is most of what "the key didn't register" turns out to be — while a finger
+     * that genuinely slides to the next key types that one.
+     */
+    private void moveTouches(MotionEvent event) {
+        KeyboardLayout layout = layout();
+        String grid = gridSignature();
+        for (int pointer = 0; pointer < event.getPointerCount(); pointer++) {
+            Touch touch = touches.get(event.getPointerId(pointer));
+            if (touch == null || touch.holdConsumed || touch.repeatFired
+                || !touch.grid.equals(grid)) {
+                // Nothing to retarget, or a hold has already acted, or the page changed under it.
+                continue;
+            }
+            float x = event.getX(pointer);
+            float y = event.getY(pointer);
+            if (touch.picker != null) {
+                // The strip is up: the finger slides along it; the column under it is the choice.
+                if (!touch.pickerMoved && escapedKey(layout, touch, x, y)) {
+                    touch.pickerMoved = true;
+                }
+                int index = touch.picker.indexAt(columnAt(layout, x), touch.pickerMoved);
+                if (index != touch.pickerIndex) {
+                    touch.pickerIndex = index;
+                    invalidate();
+                }
+                continue;
+            }
+            if (touch.guideOpen) {
+                // The guide is up: the finger is choosing, not typing. It types when it lifts.
+                CheonjiinInterpreter.Flick aimed =
+                    FlickDirection.of(x - touch.downX, y - touch.downY, flickDistancePx);
+                if (aimed != touch.guideDirection) {
+                    touch.guideDirection = aimed;
+                    invalidate();
+                }
+                continue;
+            }
+            if (tryFlick(layout, touch, x, y)) {
+                continue;
+            }
+            if (!driftedOffKey(layout, touch, x, y)) {
+                continue;
+            }
+            int[] target = TouchTargets.resolve(layout, getWidth(), getHeight(), x, y);
+            if (target == null || (target[0] == touch.row && target[1] == touch.key)) {
+                continue;
+            }
+            int rowIndex = target[0];
+            int keyIndex = target[1];
+            removeCallbacks(touch.onHold);
+            removeCallbacks(touch.onRepeat);
+            touch.row = rowIndex;
+            touch.key = keyIndex;
+            invalidate();
+            armTimers(touch, layout.rows().get(rowIndex).get(keyIndex));
+        }
+    }
+
+    /**
+     * A drag off a 12-key key types that key's dragged letter at once. Such a key never hands its
+     * finger to the neighbour, because on those pages leaving the key is itself the input.
+     */
+    private boolean tryFlick(KeyboardLayout layout, Touch touch, float x, float y) {
+        SoftwareKeySpec key = layout.rows().get(touch.row).get(touch.key);
+        if (isCycleKey(key)) {
+            CheonjiinInterpreter.Flick sideways =
+                FlickDirection.of(x - touch.downX, y - touch.downY, flickDistancePx);
+            if (sideways != CheonjiinInterpreter.Flick.LEFT
+                && sideways != CheonjiinInterpreter.Flick.RIGHT) {
+                // Up and down mean nothing on these keys, so the press stays a tap.
+                return false;
+            }
+            removeCallbacks(touch.onHold);
+            removeCallbacks(touch.onRepeat);
+            touch.holdConsumed = true;
+            typeCyclePick(key, sideways == CheonjiinInterpreter.Flick.RIGHT);
+            feedback.playKeyDown();
+            flashKeyboard(key, null);
+            return true;
+        }
+        if (key.hasFlicks()) {
+            CheonjiinInterpreter.Flick way =
+                FlickDirection.of(x - touch.downX, y - touch.downY, flickDistancePx);
+            if (way == null) {
+                return false;
+            }
+            removeCallbacks(touch.onHold);
+            removeCallbacks(touch.onRepeat);
+            touch.holdConsumed = true;
+            typeSpecFlick(key, way);
+            touch.guideOpen = true;
+            touch.guideDirection = way;
+            invalidate();
+            return true;
+        }
+        KanaFlick.Key kana = KanaFlick.of(key);
+        if (kana != null) {
+            CheonjiinInterpreter.Flick way =
+                FlickDirection.of(x - touch.downX, y - touch.downY, flickDistancePx);
+            if (way == null) {
+                return false;
+            }
+            removeCallbacks(touch.onHold);
+            removeCallbacks(touch.onRepeat);
+            touch.holdConsumed = true;
+            typeKanaFlick(key, kana, way);
+            touch.guideOpen = true;
+            touch.guideDirection = way;
+            invalidate();
+            return true;
+        }
+        if (!key.stableKeyId().startsWith("touch.cheonjiin.")) {
+            return false;
+        }
+        CheonjiinInterpreter.Flick direction =
+            FlickDirection.of(x - touch.downX, y - touch.downY, flickDistancePx);
+        if (direction == null) {
+            return false;
+        }
+        removeCallbacks(touch.onHold);
+        removeCallbacks(touch.onRepeat);
+        // The press is spent: the release must not type the key's tap letter as well.
+        touch.holdConsumed = true;
+        CheonjiinInterpreter.Key phoneKey = CheonjiinInterpreter.Key.valueOf(
+            key.stableKeyId().substring("touch.cheonjiin.".length())
+                .toUpperCase(java.util.Locale.ROOT));
+        typeFlick(key, phoneKey, direction);
+        // Show the same guide with the chosen way lit, so a drag says what it did and which way
+        // it went — the letter alone leaves the gesture unexplained. An empty cell still consumes
+        // the press: a drag that points at nothing types nothing, rather than the key's own letter.
+        touch.guideOpen = true;
+        touch.guideDirection = direction;
+        invalidate();
+        return true;
+    }
+
+    /** The 천지인 key this spec drives, or null when it is not one of them. */
+    /** Types a key's own declared flick; a direction with nothing there types nothing. */
+    private void typeSpecFlick(SoftwareKeySpec key, CheonjiinInterpreter.Flick direction) {
+        String text = key.flickText(direction);
+        if (text == null) {
+            feedback.playKeyDown();
+            return;
+        }
+        send(ProjectKeyEvent.softwareDown(key.stableKeyId(), SemanticInput.text(text)));
+        resetPhoneInterpreters();
+        consumeOneShotShift();
+        feedback.playKeyDown();
+        flashChoice(key, visibleFlickText(text));
+    }
+
+    /** What to show for a flick's text: the ZWNJ — Persian's half-space — is invisible by trade. */
+    private static String visibleFlickText(String text) {
+        return "\u200c".equals(text) ? "⌴" : text;
+    }
+
+    /** Types what a flick off a kana key means; a direction with nothing types nothing. */
+    private void typeKanaFlick(SoftwareKeySpec key, KanaFlick.Key kana,
+            CheonjiinInterpreter.Flick direction) {
+        String text = KanaFlick.flick(kana, direction);
+        if (text == null) {
+            feedback.playKeyDown();
+            return;
+        }
+        send(ProjectKeyEvent.softwareDown(key.stableKeyId(), SemanticInput.text(text)));
+        resetPhoneInterpreters();
+        feedback.playKeyDown();
+        flashChoice(key, text);
+    }
+
+    private static CheonjiinInterpreter.Key phoneKeyOf(SoftwareKeySpec key) {
+        String id = key.stableKeyId();
+        if (!id.startsWith("touch.cheonjiin.")) {
+            return null;
+        }
+        return CheonjiinInterpreter.Key.valueOf(
+            id.substring("touch.cheonjiin.".length()).toUpperCase(java.util.Locale.ROOT));
+    }
+
+    /**
+     * Types what dragging {@code direction} off this 천지인 key means, and says whether it meant
+     * anything. A direction with no letter behind it — above a consonant, or below one whose group
+     * has no tense letter — types nothing, which is why the guide leaves that cell empty.
+     */
+    private boolean typeFlick(SoftwareKeySpec key, CheonjiinInterpreter.Key phoneKey,
+            CheonjiinInterpreter.Flick direction) {
+        String label = CheonjiinInterpreter.flickLabel(phoneKey, direction);
+        if (label == null) {
+            return false;
+        }
+        emit(key, cheonjiin.flick(phoneKey, direction));
+        restartMultiTapTimeout();
+        feedback.playKeyDown();
+        flashChoice(key, label);
+        performClick();
+        return true;
+    }
+
+    /** Types a key's held alternate — the digit on a 천지인 key, whatever it is elsewhere. */
+    private void typeLongPress(SoftwareKeySpec key) {
+        typeLongPress(key, 0);
+    }
+
+    /** Types the key's {@code index}-th alternate — the one a strip was lifted on. */
+    private void typeLongPress(SoftwareKeySpec key, int index) {
+        if (!key.hasLongPress()) {
+            return;
+        }
+        send(key.longPressEvent(index));
+        resetPhoneInterpreters();
+        consumeOneShotShift();
+        feedback.playKeyDown();
+        flashChoice(key, key.longPressTexts().get(index));
+        performClick();
+    }
+
+    /** The grid column under {@code x}, clamped to the keyboard. */
+    private int columnAt(KeyboardLayout layout, float x) {
+        int width = getWidth();
+        if (width <= 0) {
+            return 0;
+        }
+        int column = (int) Math.floor(x / width * layout.columns());
+        return Math.max(0, Math.min(layout.columns() - 1, column));
+    }
+
+    /** Whether a finger has left its key's cell by more than a touch slop. */
+    /** The same, but with the wider margin a press must cross before it changes keys. */
+    private boolean driftedOffKey(KeyboardLayout layout, Touch touch, float x, float y) {
+        SoftwareKeySpec key = layout.rows().get(touch.row).get(touch.key);
+        int startColumn = layout.startColumn(touch.row, touch.key);
+        return TouchTargeting.escaped(x, y,
+            layout.columnEdge(startColumn, getWidth()),
+            layout.rowEdge(touch.row, getHeight()),
+            layout.columnEdge(startColumn + key.columnSpan(), getWidth()),
+            layout.rowEdge(touch.row + 1, getHeight()),
+            retargetPx);
+    }
+
+    private boolean escapedKey(KeyboardLayout layout, Touch touch, float x, float y) {
+        SoftwareKeySpec key = layout.rows().get(touch.row).get(touch.key);
+        int startColumn = layout.startColumn(touch.row, touch.key);
+        return TouchTargeting.escaped(x, y,
+            layout.columnEdge(startColumn, getWidth()),
+            layout.rowEdge(touch.row, getHeight()),
+            layout.columnEdge(startColumn + key.columnSpan(), getWidth()),
+            layout.rowEdge(touch.row + 1, getHeight()),
+            touchSlopPx);
+    }
+
+    /** What the grid of cells depends on: the same keys in the same places means the same value. */
+    private String gridSignature() {
+        return page + "|" + letterLayoutId + "|" + numpadMode + "|" + phoneOverlay
+            + "|" + unicodeEntry;
+    }
+
+    /** Keys that fire again while held: plain text/edit/raw keys, but not controls or layer keys. */
+    private static boolean repeatsOnHold(SoftwareKeySpec key) {
+        return key.enabled() && !key.isControl()
+            && !key.hasLongPress() && !key.hasLongPressControl();
+    }
+
+    /** Fires the held key once and schedules the next repeat, until the finger lifts. */
+    private void handleRepeat(Touch touch) {
+        if (touches.get(touch.pointerId) != touch) {
+            return;
+        }
+        SoftwareKeySpec key = layout().rows().get(touch.row).get(touch.key);
+        if (!repeatsOnHold(key)) {
+            return;
+        }
+        if (!emitPhoneKey(key)) {
+            send(pressEventWithModifiers(key));
+        }
+        touch.repeatFired = true;
+        feedback.playKeyDown();
+        flashKeyboard(key, null);
+        postDelayed(touch.onRepeat, repeatIntervalMs);
+    }
+
+    /** Ends this finger's key: it types unless a hold already acted for it. */
+    private void endTouch(int pointerId, float x, float y) {
+        Touch touch = touches.get(pointerId);
+        if (touch == null) {
+            return;
+        }
+        forget(touch);
+        invalidate();
+        if (touch.holdConsumed || touch.repeatFired) {
+            // A hold already acted — shift lock, a layer switch, an alternate, or auto-repeat — so
+            // the release must not also fire the tap.
+            return;
+        }
+        if (!touch.grid.equals(gridSignature())) {
+            // Another finger switched the page while this one was down; its key is gone.
+            return;
+        }
+        if (touch.picker != null) {
+            // Held, slid, lifted: the candidate the finger is on is what types.
+            SoftwareKeySpec held = layout().rows().get(touch.row).get(touch.key);
+            if (touch.pickerMoved || escapedKey(layout(), touch, x, y)) {
+                touch.pickerIndex = touch.picker.indexAt(columnAt(layout(), x), true);
+            }
+            typeLongPress(held, Math.min(touch.pickerIndex, held.longPressTexts().size() - 1));
+            return;
+        }
+        if (touch.guideOpen) {
+            // Held, then lifted: whatever the guide was showing under the finger is what types.
+            SoftwareKeySpec held = layout().rows().get(touch.row).get(touch.key);
+            CheonjiinInterpreter.Flick aimed =
+                FlickDirection.of(x - touch.downX, y - touch.downY, flickDistancePx);
+            if (aimed == null) {
+                typeLongPress(held);
+            } else if (held.hasFlicks()) {
+                typeSpecFlick(held, aimed);
+            } else if (KanaFlick.of(held) != null) {
+                typeKanaFlick(held, KanaFlick.of(held), aimed);
+            } else {
+                typeFlick(held, phoneKeyOf(held), aimed);
+            }
+            return;
+        }
+        if (tryFlick(layout(), touch, x, y)) {
+            // A drag too quick to have reported a move on the way is still a drag.
+            return;
+        }
+        // The finger types the key it is on, which moves are what decide. Where it happens to lift
+        // is not a second chance to disagree: a release re-tested against the layout drops the
+        // keystroke whenever the fingertip drifted a pixel, and the drift is what people notice.
+        SoftwareKeySpec held = layout().rows().get(touch.row).get(touch.key);
+        if (held.isControl()) {
+            if (touch.heldModifier != null) {
+                // Armed when it went down; the lift only decides whether it was used.
+                releaseModifier(touch);
+            } else {
+                applyControl(held.control());
+            }
+            flashKeyboard(held, null);
+            performClick();
+            return;
+        }
+        if (held.enabled()) {
+            typeTapped(held);
+        }
+    }
+
+    /** Types an enabled, non-control key: the armed chord, the 12-key run, or the plain press. */
+    private void typeTapped(SoftwareKeySpec held) {
+        if (tryArmedModifierChord(held)) {
+            flashKeyboard(held, null);
+            performClick();
+            return;
+        }
+        if (!emitPhoneKey(held)) {
+            send(pressEventWithModifiers(held));
+        }
+        consumeOneShotShift();
+        flashKeyboard(held, null);
+        performClick();
+    }
+
+    /**
+     * Types every finger still waiting to type on release, in the order it went down, and spends
+     * its press so the release types nothing more. Fingers whose press already acted — a hold, a
+     * repeat, an open flick guide — and fingers on control keys are left exactly as they are.
+     */
+    private void settlePendingTaps() {
+        String grid = gridSignature();
+        java.util.List<Touch> pending = new java.util.ArrayList<>(touches.size());
+        for (int i = 0; i < touches.size(); i++) {
+            pending.add(touches.valueAt(i));
+        }
+        java.util.Collections.sort(pending, (a, b) -> Integer.compare(a.serial, b.serial));
+        for (Touch touch : pending) {
+            if (touch.holdConsumed || touch.repeatFired || touch.guideOpen || touch.picker != null
+                || !touch.grid.equals(grid)) {
+                continue;
+            }
+            SoftwareKeySpec held = layout().rows().get(touch.row).get(touch.key);
+            if (held.isControl() || !held.enabled()) {
+                continue;
+            }
+            removeCallbacks(touch.onHold);
+            removeCallbacks(touch.onRepeat);
+            touch.holdConsumed = true;
+            typeTapped(held);
+        }
+    }
+
+    /**
+     * Every keystroke the keyboard sends, counted. A Shift held while a letter is tapped has to
+     * know whether that letter used it: if it did, letting Shift up must not leave it armed for
+     * the next key as well (§15.37).
+     */
+    private void send(ProjectKeyEvent event) {
+        typedCount++;
+        sink.accept(event);
+    }
+
+    /** Drops a finger's timers and its claim on a key. */
+    private void forget(Touch touch) {
+        removeCallbacks(touch.onHold);
+        removeCallbacks(touch.onRepeat);
+        touches.remove(touch.pointerId);
+    }
+
+    /** The gesture was cancelled: no finger types. */
+    private void cancelAllTouches() {
+        for (int i = touches.size() - 1; i >= 0; i--) {
+            Touch touch = touches.valueAt(i);
+            removeCallbacks(touch.onHold);
+            removeCallbacks(touch.onRepeat);
+            unwindModifier(touch);
+        }
+        touches.clear();
+        invalidate();
+    }
+
+    /**
+     * A finger on a modifier that never lifted — it slid off the keyboard, the view was rebuilt
+     * under it, the window went away. The press is taken back: the latch goes to what it held
+     * before that finger landed. Where a key was typed while it was down, the chord happened, so
+     * the one-shot is spent the way a release spends it instead. Before this, a canceled Shift
+     * stayed armed and shifted whatever was typed next (review finding R11).
+     */
+    private void unwindModifier(Touch touch) {
+        ControlKey control = touch.heldModifier;
+        if (control == null) {
+            return;
+        }
+        if (typedCount != touch.typedAtDown) {
+            releaseModifier(touch);
+            return;
+        }
+        if (holdsTheSameModifier(touch)) {
+            // Another finger is still on it: that one owns the state now.
+            return;
+        }
+        if (control == ControlKey.SHIFT) {
+            shiftLayer.restore(touch.latchBeforePress);
+        } else {
+            modifierLatches.restore(control, touch.latchBeforePress);
+        }
+    }
+
+    /** Whether another finger still down is holding the same modifier this one armed. */
+    private boolean holdsTheSameModifier(Touch canceled) {
+        for (int i = touches.size() - 1; i >= 0; i--) {
+            Touch other = touches.valueAt(i);
+            if (other != canceled && other.heldModifier == canceled.heldModifier) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * With a soft Ctrl armed, a letter key runs the matching editor command (Ctrl+A/C/V/X/Z/Y)
+     * instead of typing the letter, so those shortcuts work from the on-screen keyboard too.
+     */
+    /**
+     * With a soft Ctrl/Alt/Meta armed, a letter key is sent as a real key chord (e.g. Ctrl+B)
+     * instead of typed. Rich editors turn Ctrl+A/C/V/X/Z/Y into select-all/copy/paste/cut/undo/redo
+     * via {@code onKeyShortcut}; terminals receive the control code (Ctrl+B → 0x02). The armed
+     * modifiers are one-shot: consumed after the chord.
+     */
+    private boolean tryArmedModifierChord(SoftwareKeySpec key) {
+        Set<KeyModifier> mods = modifierLatches.active();
+        if (mods.isEmpty()) {
+            return false;
+        }
+        SemanticInput input = key.semanticInput();
+        if (input == null) {
+            return false;
+        }
+        RawKey rawKey = input.kind() == SemanticInput.Kind.JAMO
+            // A Korean key chords as the letter in its place (ChordLetters): Ctrl+ㅊ is Ctrl+C.
+            ? ChordLetters.forKeyId(key.stableKeyId())
+            : latinLetterKey(input);
+        if (rawKey == null) {
+            return false;
+        }
+        send(ProjectKeyEvent.softwareDown(
+            key.stableKeyId(), SemanticInput.rawKey(rawKey, mods)));
+        consumeOneShotModifiers();
+        consumeOneShotShift();
+        invalidate();
+        return true;
+    }
+
+    private static RawKey latinLetterKey(SemanticInput input) {
+        if (input.kind() != SemanticInput.Kind.TEXT) {
+            return null;
+        }
+        String text = input.text();
+        if (text == null || text.length() != 1) {
+            return null;
+        }
+        char letter = Character.toUpperCase(text.charAt(0));
+        if (letter < 'A' || letter > 'Z') {
+            return null;
+        }
+        try {
+            return RawKey.valueOf(String.valueOf(letter));
+        } catch (IllegalArgumentException notALetterKey) {
+            return null;
+        }
+    }
+
+    /**
+     * Presses Tab and leaves it pressed, or lets it up again. A tap on Tab types one and is over;
+     * this is the other thing a finger can do to a key, and a keyboard drawn on glass has no way
+     * to keep one down, so the hold toggles it. No modifier is folded in: an armed Ctrl stays
+     * armed for whatever key comes next rather than being spent on the latch.
+     */
+    private void toggleTabHold() {
+        tabHeld = !tabHeld;
+        send(ProjectKeyEvent.softwareDown(
+            TAB_KEY_ID,
+            SemanticInput.rawKey(
+                RawKey.TAB,
+                EnumSet.noneOf(KeyModifier.class),
+                tabHeld ? RawKeyPhase.HOLD : RawKeyPhase.RELEASE)));
+    }
+
+    /**
+     * Caps Lock: one tap sends the key and flips the face. The editor's own lock is what changes;
+     * we only remember which way we last flipped it, so the key reads on or off at a glance.
+     */
+    private void toggleCapsLock() {
+        capsLocked = !capsLocked;
+        send(ProjectKeyEvent.softwareDown(
+            CAPS_KEY_ID, SemanticInput.rawKey(RawKey.CAPS_LOCK)));
+    }
+
+    /** Lets a latched Tab up, so a held key cannot outlive the editor it was held in. */
+    private void releaseTabHoldIfLatched() {
+        if (tabHeld) {
+            toggleTabHold();
+        }
+    }
+
+    /**
+     * The modifiers a raw key is sent with: the armed or locked Ctrl, Meta and Alt, and Shift.
+     *
+     * <p>Shift is here because a raw key has no shifted character to pick — an arrow, Home, Page
+     * Down. On a letter the Shift key chooses a layer and that is the whole of its meaning; on a
+     * key that has no layer to choose, the only thing it can mean is the chord every keyboard
+     * makes with it, which is why Shift+arrow selects text. Without this the Shift key simply did
+     * nothing on those keys, on the pad page and on the action bar alike.
+     */
+    public Set<KeyModifier> rawKeyModifiers() {
+        return RawKeyModifiers.of(modifierLatches.active(), shiftLayer.isActive());
+    }
+
+    /** Spends whatever one-shot modifiers a raw key just used, Shift included. */
+    public void consumeRawKeyModifiers() {
+        consumeOneShotModifiers();
+        consumeOneShotShift();
+    }
+
+    /** Folds the active modifiers into a raw key so it forms a chord; other keys are unchanged. */
+    private ProjectKeyEvent pressEventWithModifiers(SoftwareKeySpec key) {
+        SemanticInput input = key.semanticInput();
+        if (input.kind() != SemanticInput.Kind.RAW_KEY) {
+            return key.pressEvent();
+        }
+        Set<KeyModifier> mods = rawKeyModifiers();
+        if (mods.isEmpty()) {
+            return key.pressEvent();
+        }
+        return ProjectKeyEvent.softwareDown(key.stableKeyId(), input.withModifiers(mods));
+    }
+
+    private void handleLongPress(Touch touch) {
+        if (touches.get(touch.pointerId) != touch) {
+            return;
+        }
+        SoftwareKeySpec key = layout().rows().get(touch.row).get(touch.key);
+        if (key.isControl() && key.control() == ControlKey.SHIFT) {
+            shiftLayer.toggleLock();
+            touch.holdConsumed = true;
+            invalidate();
+            return;
+        }
+        if (key.isControl() && ModifierLatches.handles(key.control())) {
+            // Holding a modifier keeps it down until it is held again, the way a finger would.
+            modifierLatches.hold(key.control());
+            touch.holdConsumed = true;
+            feedback.playKeyDown();
+            invalidate();
+            return;
+        }
+        if (key.hasLongPressControl()) {
+            applyControl(key.longPressControl());
+            touch.holdConsumed = true;
+            return;
+        }
+        if (phoneKeyOf(key) != null || KanaFlick.of(key) != null || key.hasFlicks()) {
+            // A 12-key cell has four letters around it and a digit under it, so holding one shows
+            // what is where and waits. Lift without moving and the digit is what you meant; drag
+            // to one of the four and lift, and that is.
+            touch.guideOpen = true;
+            feedback.playKeyDown();
+            invalidate();
+            return;
+        }
+        if (key.hasLongPress() && key.longPressTexts().size() > 1) {
+            // Several alternates: raise the strip and wait. Lift without moving and the first is
+            // what you meant; slide along the strip and lift, and that one is.
+            KeyboardLayout layout = layout();
+            touch.picker = HoldPicker.place(layout.columns(), touch.row,
+                layout.startColumn(touch.row, touch.key), key.columnSpan(),
+                key.longPressTexts().size());
+            touch.pickerIndex = 0;
+            touch.pickerMoved = false;
+            feedback.playKeyDown();
+            invalidate();
+            return;
+        }
+        if (key.hasLongPress()) {
+            // Holding a key types its one alternate straight away. There is no popup to aim at
+            // and nothing to drag to: the finger is already where it needs to be.
+            send(key.longPressEvent(0));
+            // The alternate is not part of a 12-key run, so it ends one.
+            resetPhoneInterpreters();
+            consumeOneShotShift();
+            feedback.playKeyDown();
+            flashChoice(key, key.longPressTexts().get(0));
+            touch.holdConsumed = true;
+            performClick();
+        }
+    }
+
+    /**
+     * Sends a 12-key press through its interpreter, which answers with the edits it means — a jamo,
+     * or a backspace and the jamo that replaces it. Returns false for every other key, which the
+     * caller then emits itself.
+     */
+    /** Whether this key holds several characters and cycles through them as it is tapped. */
+    private static boolean isCycleKey(SoftwareKeySpec key) {
+        return key.stableKeyId().startsWith("touch.phone.cycle.");
+    }
+
+    /** Forgets which cycling key was mid-run, so the next tap starts its label again. */
+    private void endCycleRun() {
+        cycleKeyId = null;
+        cycleIndex = -1;
+    }
+
+    /**
+     * Types a cycling key. A tap that lands while this same key's run is still open takes back the
+     * character it typed and puts the next one in its place; anything else starts the label again.
+     */
+    private void typeCycle(SoftwareKeySpec key) {
+        List<String> characters = MultiTapCycle.charactersOf(key.label());
+        boolean runIsOpen = key.stableKeyId().equals(cycleKeyId) && cycleIndex >= 0;
+        MultiTapCycle.Step step = MultiTapCycle.press(characters, cycleIndex, runIsOpen);
+        emitCycleStep(key, step);
+        cycleKeyId = key.stableKeyId();
+        cycleIndex = step.index;
+        restartMultiTapTimeout();
+    }
+
+    /** Types the character a drag picked, and ends the run: a drag chooses rather than cycles. */
+    private void typeCyclePick(SoftwareKeySpec key, boolean rightwards) {
+        emitCycleStep(key, MultiTapCycle.pick(MultiTapCycle.charactersOf(key.label()), rightwards));
+        endCycleRun();
+        removeCallbacks(endMultiTap);
+    }
+
+    private void emitCycleStep(SoftwareKeySpec key, MultiTapCycle.Step step) {
+        List<SemanticInput> inputs = new java.util.ArrayList<>(2);
+        if (step.replacesPrevious) {
+            inputs.add(SemanticInput.deleteForCorrection());
+        }
+        inputs.add(SemanticInput.text(step.character));
+        emit(key, inputs);
+    }
+
+    private boolean emitPhoneKey(SoftwareKeySpec key) {
+        if (isCycleKey(key)) {
+            // The Hangul run ends — a period is not part of the syllable being spelled — but this
+            // key's own run carries on, which is what lets a second tap turn . into ,
+            cheonjiin.reset();
+            naratgeul.reset();
+            typeCycle(key);
+            return true;
+        }
+        String id = key.stableKeyId();
+        if (id.startsWith("touch.cheonjiin.")) {
+            emit(key, cheonjiin.press(CheonjiinInterpreter.Key.valueOf(
+                id.substring("touch.cheonjiin.".length()).toUpperCase(java.util.Locale.ROOT))));
+            restartMultiTapTimeout();
+            return true;
+        }
+        if (id.startsWith("touch.naratgeul.")) {
+            NaratgeulInterpreter.Key phoneKey = NaratgeulInterpreter.Key.valueOf(
+                id.substring("touch.naratgeul.".length()).toUpperCase(java.util.Locale.ROOT));
+            java.util.List<SemanticInput> edits = naratgeul.press(phoneKey);
+            if (edits.isEmpty() && (phoneKey == NaratgeulInterpreter.Key.STROKE
+                || phoneKey == NaratgeulInterpreter.Key.TWIN)) {
+                // The run is broken — a restart, a hardware key, a layer switch — but the letter
+                // is still on screen. The processor resolves the transform against what is
+                // actually there: the composing syllable, or the character before the cursor.
+                edits = java.util.Collections.singletonList(SemanticInput.transform(
+                    phoneKey == NaratgeulInterpreter.Key.STROKE
+                        ? SemanticInput.Transform.STROKE
+                        : SemanticInput.Transform.TWIN));
+            }
+            emit(key, edits);
+            return true;
+        }
+        // Anything else — space, the commit key, a layer key — ends the run, so the next tap on a
+        // consonant key types its first letter instead of continuing the one before.
+        resetPhoneInterpreters();
+        return false;
+    }
+
+    private void emit(SoftwareKeySpec key, java.util.List<SemanticInput> inputs) {
+        for (SemanticInput input : inputs) {
+            send(ProjectKeyEvent.softwareDown(key.stableKeyId(), input));
+        }
+    }
+
+    private void restartMultiTapTimeout() {
+        removeCallbacks(endMultiTap);
+        postDelayed(endMultiTap, MULTI_TAP_TIMEOUT_MS);
+    }
+
+    /** A 12-key run ends when the layout or page changes, or the editor does. */
+    public void resetPhoneInterpreters() {
+        removeCallbacks(endMultiTap);
+        cheonjiin.reset();
+        naratgeul.reset();
+        endCycleRun();
+    }
+
+    /** The toggle's own key turns its overlay on and off; the other key switches straight over. */
+    private void togglePhoneOverlay(PhoneOverlay overlay) {
+        phoneOverlay = phoneOverlay == overlay ? PhoneOverlay.NONE : overlay;
+        // The Hangul run cannot continue across the pad changing meaning under the fingers.
+        resetPhoneInterpreters();
+        invalidate();
+    }
+
+    private void consumeOneShotModifiers() {
+        if (isModifierFingerDown(ControlKey.CTRL)) {
+            return;
+        }
+        if (modifierLatches.consumeOneShots()) {
+            invalidate();
+        }
+    }
+
+    private void consumeOneShotShift() {
+        if (isModifierFingerDown(ControlKey.SHIFT)) {
+            // Still held: it applies to every key typed under it, the way a keyboard's Shift does.
+            return;
+        }
+        if (shiftLayer.consumeOneShot()) {
+            invalidate();
+        }
+    }
+
+    /** Whether a finger is on that modifier's key right now. */
+    private boolean isModifierFingerDown(ControlKey control) {
+        for (int i = 0; i < touches.size(); i++) {
+            Touch touch = touches.valueAt(i);
+            if (touch.heldModifier == control
+                || (control != ControlKey.SHIFT && touch.heldModifier != null
+                    && touch.heldModifier != ControlKey.SHIFT)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Shows the symbols page, for the action bar's Sym slot. The `!#` key does the same thing from
+     * the keyboard itself; this is the same door with a different handle.
+     */
+    public void showSpecialChars() {
+        page = Page.SPECIAL_CHARS;
+        shiftLayer.clear();
+        invalidate();
+    }
+
+    /**
+     * Puts the view into one named state so a picture can be taken of it. Used only by the debug
+     * build's screenshot screen: the README's images have to come from the drawing code itself
+     * rather than from a mock-up, and the emulator this project is developed on never gives an IME
+     * window a drawing surface, so photographing the real keyboard means drawing it into an
+     * ordinary window instead.
+     *
+     * <p>The spec is a colon-separated name — {@code letters:KO_DUBEOLSIK}, {@code chars},
+     * {@code keys:ARROWS}, {@code menu}, {@code unicode}, {@code phone:KO_CHEONJIIN:DIGITS} — so
+     * the debug screen can name every page without this class exposing its private state.
+     */
+    void showPreview(String spec) {
+        String[] parts = spec.split(":");
+        unicodeEntry = false;
+        phoneOverlay = PhoneOverlay.NONE;
+        switch (parts[0]) {
+            case "chars":
+                page = Page.SPECIAL_CHARS;
+                break;
+            case "keys":
+                page = Page.SPECIAL_KEYS;
+                numpadMode = parts.length > 1 ? NumpadMode.valueOf(parts[1]) : NumpadMode.NUMBERS;
+                break;
+            case "menu":
+                page = Page.MENU;
+                break;
+            case "unicode":
+                unicodeEntry = true;
+                // A picture of an empty pad says nothing about what it is for, so it is shown
+                // mid-entry, on a character no keyboard hands you.
+                unicodePreview = parts.length > 1 ? parts[1] : "U+2318   \u2318";
+                break;
+            case "phone":
+                page = Page.LETTERS;
+                letterLayoutId = KeyboardLayoutId.valueOf(parts[1]);
+                phoneOverlay = parts.length > 2
+                    ? PhoneOverlay.valueOf(parts[2]) : PhoneOverlay.NONE;
+                break;
+            case "shifted":
+                // shifted:LAYOUT — the page with Shift down, for pictures of capitals.
+                page = Page.LETTERS;
+                letterLayoutId = KeyboardLayoutId.valueOf(parts[1]);
+                shiftLayer.tap();
+                break;
+            case "fiverow":
+                // A five-row page — a digit row over QWERTY — at the same keyboard height, for the
+                // picture that proves the geometry divides by the row count rather than assuming
+                // four. Nothing ships it yet; the row height simply comes out one fifth.
+                previewLayout = KeyboardLayouts.fiveRowDemo();
+                break;
+            case "echo": {
+                // echo:LAYOUT:text[:choice][:opacity] — the box that shows what was just typed,
+                // for pictures of it: the plain kind, the choosing kind, and a see-through one.
+                page = Page.LETTERS;
+                letterLayoutId = KeyboardLayoutId.valueOf(parts[1]);
+                flashing = true;
+                flashLabel = parts.length > 2 ? parts[2] : "가";
+                flashFromChoice = parts.length > 3 && "choice".equals(parts[3]);
+                echoBoxEnabled = true;
+                if (parts.length > 4) {
+                    echoBoxOpacity = EchoBoxSettings.clampOpacity(Integer.parseInt(parts[4]));
+                }
+                break;
+            }
+            case "guide": {
+                // guide:LAYOUT:row:key[:DIRECTION] — the four-way guide a held flicking key
+                // raises, for pictures. The finger is pretended down on that key.
+                page = Page.LETTERS;
+                letterLayoutId = KeyboardLayoutId.valueOf(parts[1]);
+                Touch pretend = new Touch(-2, Integer.parseInt(parts[2]),
+                    Integer.parseInt(parts[3]), gridSignature(), 0f, 0f);
+                pretend.guideOpen = true;
+                pretend.guideDirection = parts.length > 4
+                    ? CheonjiinInterpreter.Flick.valueOf(parts[4]) : null;
+                touches.put(-2, pretend);
+                break;
+            }
+            case "hold": {
+                // hold:LAYOUT:row:key:cand1,cand2,... — the strip a held key raises, for pictures.
+                // The finger is pretended to be down on that key, not moved.
+                page = Page.LETTERS;
+                letterLayoutId = KeyboardLayoutId.valueOf(parts[1]);
+                int row = Integer.parseInt(parts[2]);
+                int keyIndex = Integer.parseInt(parts[3]);
+                List<String> candidates = java.util.Arrays.asList(parts[4].split(","));
+                KeyboardLayout layout = layout();
+                SoftwareKeySpec key = layout.rows().get(row).get(keyIndex);
+                Touch pretend = new Touch(-1, row, keyIndex, gridSignature(), 0f, 0f);
+                pretend.picker = HoldPicker.place(layout.columns(), row,
+                    layout.startColumn(row, keyIndex), key.columnSpan(), candidates.size());
+                pretend.pickerPreview = candidates;
+                pretend.pickerIndex = parts.length > 5 ? Integer.parseInt(parts[5]) : 0;
+                touches.put(-1, pretend);
+                break;
+            }
+            default:
+                page = Page.LETTERS;
+                if (parts.length > 1) {
+                    letterLayoutId = KeyboardLayoutId.valueOf(parts[1]);
+                }
+                break;
+        }
+        requestLayout();
+        invalidate();
+    }
+
+    /** What the hex pad's strip shows: the code typed so far, and the character it names. */
+    public void setUnicodePreview(String text) {
+        if (unicodePreview.equals(text)) {
+            return;
+        }
+        unicodePreview = text;
+        invalidate();
+        requestLayout();
+    }
+
+    /** Shows or hides the hex pad the U+ entry types on. */
+    public void setUnicodeEntry(boolean active) {
+        if (unicodeEntry == active) {
+            return;
+        }
+        unicodeEntry = active;
+        unicodePreview = "U+";
+        cancelAllTouches();
+        requestLayout();
+        invalidate();
+    }
+
+    /** Opens the notepad panel, which the service owns. */
+    public void setOnNotepad(Runnable listener) {
+        this.onNotepad = listener;
+    }
+
+    /** Called when the clipboard tile on the menu page is pressed. */
+    public void setOnClipboard(Runnable listener) {
+        this.onClipboard = listener;
+    }
+
+    /** Called by the IPA page's Find key: a symbol by the name the user has for it. */
+    public void setOnIpaFind(Runnable listener) {
+        this.onIpaFind = listener;
+    }
+
+    /** Called by the same key held: the symbols by family instead. */
+    public void setOnIpaChart(Runnable listener) {
+        this.onIpaChart = listener;
+    }
+
+    /** Opens the U+ code-point entry, which the service owns. */
+    public void setOnUnicodeInput(Runnable listener) {
+        this.onUnicodeInput = listener;
+    }
+
+    private void runEditCommand(int contextMenuId) {
+        if (onEditCommand != null) {
+            onEditCommand.accept(contextMenuId);
+        }
+    }
+
+    private int rowAt(KeyboardLayout layout, float y) {
+        int height = getHeight();
+        if (height <= 0 || y < 0.0f || y >= height) {
+            return -1;
+        }
+        int rows = layout.rows().size();
+        return Math.min(rows - 1, (int) (y * rows / height));
+    }
+
+    private int keyIndexAt(KeyboardLayout layout, int rowIndex, float x) {
+        int width = getWidth();
+        if (rowIndex < 0 || width <= 0 || x < 0.0f || x >= width) {
+            return -1;
+        }
+        int column = Math.min(layout.columns() - 1, (int) (x * layout.columns() / width));
+        List<SoftwareKeySpec> keys = layout.rows().get(rowIndex);
+        int cursor = 0;
+        for (int index = 0; index < keys.size(); index++) {
+            cursor += keys.get(index).columnSpan();
+            if (column < cursor) {
+                return index;
+            }
+        }
+        return keys.size() - 1;
+    }
+
+
+    private void applyControl(ControlKey control) {
+        switch (control) {
+            case SHIFT:
+                shiftLayer.tap();
+                break;
+            case LAYOUT_TOGGLE:
+                // The globe walks the layouts the user enabled, in their order. From another page
+                // it just returns to letters, keeping the layout that was last in use.
+                if (page == Page.LETTERS) {
+                    letterLayoutId = LetterLayouts.next(letterOrder(), letterLayoutId);
+                    phoneOverlay = PhoneOverlay.NONE;
+                    resetPhoneInterpreters();
+                    prefs().edit().putString(KEY_LAST_LETTERS, letterLayoutId.name()).apply();
+                    if (onLayoutChanged != null) {
+                        onLayoutChanged.accept(letterLayoutId);
+                    }
+                }
+                page = Page.LETTERS;
+                shiftLayer.clear();
+                break;
+            case SPECIAL_CHARS_LAYER:
+                page = Page.SPECIAL_CHARS;
+                shiftLayer.clear();
+                break;
+            case SPECIAL_KEYS_LAYER:
+                page = Page.SPECIAL_KEYS;
+                numpadMode = NumpadMode.NUMBERS;
+                shiftLayer.clear();
+                break;
+            case MENU_LAYER:
+                page = Page.MENU;
+                shiftLayer.clear();
+                break;
+            case PREVIOUS_LAYER:
+                page = Page.LETTERS;
+                shiftLayer.clear();
+                break;
+            case NOTEPAD:
+                if (onNotepad != null) {
+                    onNotepad.run();
+                }
+                break;
+            case CLIPBOARD:
+                if (onClipboard != null) {
+                    onClipboard.run();
+                }
+                break;
+            case IPA_FIND:
+                if (onIpaFind != null) {
+                    onIpaFind.run();
+                }
+                break;
+            case IPA_CHART:
+                if (onIpaChart != null) {
+                    onIpaChart.run();
+                }
+                break;
+            case UNICODE_INPUT:
+                if (onUnicodeInput != null) {
+                    onUnicodeInput.run();
+                }
+                break;
+            case PHONE_DIGITS:
+                togglePhoneOverlay(PhoneOverlay.DIGITS);
+                break;
+            case PHONE_NAV:
+                togglePhoneOverlay(PhoneOverlay.NAV);
+                break;
+            case NUMLOCK:
+                numpadMode = numpadMode == NumpadMode.ARROWS
+                    ? NumpadMode.NUMBERS
+                    : NumpadMode.ARROWS;
+                break;
+            case FUNCTION_LOCK:
+                numpadMode = numpadMode == NumpadMode.FUNCTIONS
+                    ? NumpadMode.NUMBERS
+                    : NumpadMode.FUNCTIONS;
+                break;
+            case OPEN_SETTINGS:
+                if (onOpenSettings != null) {
+                    onOpenSettings.run();
+                }
+                break;
+            case HEIGHT_UP:
+                setKeyboardHeightPercent(
+                    heightPercent() + KeyboardHeightPercent.STEP_PERCENT, true);
+                break;
+            case HEIGHT_DOWN:
+                setKeyboardHeightPercent(
+                    heightPercent() - KeyboardHeightPercent.STEP_PERCENT, true);
+                break;
+            case COPY:
+                runEditCommand(android.R.id.copy);
+                break;
+            case CUT:
+                runEditCommand(android.R.id.cut);
+                break;
+            case PASTE:
+                runEditCommand(android.R.id.paste);
+                break;
+            case UNDO:
+                runEditCommand(EditMenuIds.UNDO);
+                break;
+            case REDO:
+                runEditCommand(EditMenuIds.REDO);
+                break;
+            case SELECT_ALL:
+                runEditCommand(android.R.id.selectAll);
+                break;
+            case INSERT_DATE:
+                if (onInsertDate != null) {
+                    onInsertDate.run();
+                }
+                break;
+            case SWITCH_IME:
+                if (onSwitchIme != null) {
+                    onSwitchIme.run();
+                }
+                break;
+            case MANAGE_IME:
+                if (onManageIme != null) {
+                    onManageIme.run();
+                }
+                break;
+            case HANJA:
+                if (onHanja != null) {
+                    onHanja.run();
+                }
+                break;
+            case FLOATING_TOGGLE:
+                if (onFloatingToggle != null) {
+                    onFloatingToggle.run();
+                }
+                break;
+            case KANA_MODIFIER:
+                if (onKanaModifier != null) {
+                    onKanaModifier.run();
+                }
+                break;
+            case THEME_CYCLE:
+                if (onThemeCycle != null) {
+                    onThemeCycle.run();
+                }
+                break;
+            case CTRL:
+            case META:
+            case ALT:
+            case RSHIFT:
+                // A tap arms it for one key; a hold locks it. Both are view-local: what reaches
+                // the editor is the chord the next key makes.
+                modifierLatches.tap(control);
+                break;
+            case TAB_HOLD:
+                toggleTabHold();
+                break;
+            case CAPS_LOCK:
+                toggleCapsLock();
+                break;
+            default:
+                break;
+        }
+        invalidate();
+    }
+
+    /**
+     * A key's face. A key that is <em>held</em> — locked down until it is pressed again, rather
+     * than armed for the next keystroke — is drawn inverted: the face takes the ink colour and the
+     * label takes the face's, which is the strongest thing a two-colour key can say and reads at a
+     * glance from across the keyboard. Armed-for-one-key keeps the softer accent, so the two
+     * states cannot be mistaken for each other.
+     */
+    private int keyFillColor(SoftwareKeySpec key) {
+        if (key.isControl()) {
+            ControlKey control = key.control();
+            if (control == ControlKey.SHIFT) {
+                if (shiftLayer.isLocked()) {
+                    return palette.keyLatchedFace();
+                }
+                if (shiftLayer.isActive()) {
+                    return palette.keyAccent;
+                }
+            }
+            if (control == ControlKey.NUMLOCK && numpadMode == NumpadMode.NUMBERS) {
+                // Num lock on means digits, as on any keyboard: the pad starts locked, and it is
+                // turning it off that reaches the arrows.
+                return palette.keyAccent;
+            }
+            if (control == ControlKey.FUNCTION_LOCK && numpadMode == NumpadMode.FUNCTIONS) {
+                return palette.keyAccent;
+            }
+            if (modifierLatches.isLocked(control)) {
+                return palette.keyLatchedFace();
+            }
+            if (modifierLatches.isActive(control)) {
+                return palette.keyAccent;
+            }
+        }
+        if (tabHeld && TAB_KEY_ID.equals(key.stableKeyId())) {
+            // Tab latched down is held, not armed, so it inverts like the modifiers do.
+            return palette.keyLatchedFace();
+        }
+        if (capsLocked && CAPS_KEY_ID.equals(key.stableKeyId())) {
+            // Caps on reads the same way a held Tab does: the strongest thing a face can say.
+            return palette.keyLatchedFace();
+        }
+        if (!key.enabled() && !key.isControl()) {
+            return palette.keyDisabled;
+        }
+        return palette.keyFace;
+    }
+}

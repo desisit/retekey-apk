@@ -1,0 +1,94 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.VIBRATE" />
+    <application
+        android:allowBackup="false"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:fullBackupContent="false"
+        android:icon="@drawable/ic_retekey"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@style/ReteImeTheme">
+        <activity
+            android:name=".PreviewActivity"
+            android:exported="true"
+            android:label="@string/app_name"
+            android:theme="@style/ReteScreenTheme">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+        <activity
+            android:name=".ActionBarSettingsActivity"
+            android:exported="false"
+            android:label="@string/bar_settings_title"
+            android:theme="@style/ReteScreenTheme" />
+        <activity
+            android:name=".ShareTargetActivity"
+            android:excludeFromRecents="true"
+            android:exported="true"
+            android:label="@string/stash_share_label"
+            android:noHistory="true"
+            android:taskAffinity=""
+            android:theme="@android:style/Theme.Translucent.NoTitleBar">
+            <!-- Text shared from any app is kept inside ReteKey, never on the system clipboard. -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/plain" />
+            </intent-filter>
+            <!-- And the same from a text selection's own menu, where there is even less to copy. -->
+            <intent-filter>
+                <action android:name="android.intent.action.PROCESS_TEXT" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/plain" />
+            </intent-filter>
+        </activity>
+        <!--
+            The layout door, separate from the text one (issue #11): sharing to ReteKey keeps text
+            and never installs anything, and this entry installs a layout and never keeps text, so
+            neither can be mistaken for the other by what the text happens to begin with. A .rkl
+            file opened from a file manager or a mail attachment arrives here too.
+        -->
+        <activity-alias
+            android:name=".InstallLayoutActivity"
+            android:excludeFromRecents="true"
+            android:exported="true"
+            android:label="@string/layout_share_label"
+            android:targetActivity=".ShareTargetActivity">
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="text/plain" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="content" />
+                <data android:scheme="file" />
+                <data android:mimeType="*/*" />
+                <data android:host="*" />
+                <data android:pathPattern=".*\\.rkl" />
+            </intent-filter>
+        </activity-alias>
+        <activity
+            android:name=".SettingsActivity"
+            android:exported="true"
+            android:label="@string/settings_title"
+            android:theme="@style/ReteScreenTheme" />
+        <service
+            android:name=".ReteKeyImeService"
+            android:directBootAware="true"
+            android:exported="true"
+            android:label="@string/ime_name"
+            android:permission="android.permission.BIND_INPUT_METHOD">
+            <intent-filter>
+                <action android:name="android.view.InputMethod" />
+            </intent-filter>
+            <meta-data
+                android:name="android.view.im"
+                android:resource="@xml/method" />
+        </service>
+    </application>
+</manifest>

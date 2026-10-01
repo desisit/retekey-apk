@@ -1,0 +1,55 @@
+package com.retekey;
+
+import android.content.Context;
+import android.view.View;
+import android.widget.LinearLayout;
+
+/**
+ * A panel above the keyboard, filling the window. The bottom block is the keyboard as it is
+ * docked — action bar included, when the user has one: opening a panel must not take it away.
+ *
+ * <p>The same shape as {@link NotepadFrame} — the keyboard keeps its own height at the bottom and
+ * the panel takes the rest — for anything that is a list rather than a way of typing: the clipboard
+ * today, whatever stage 3 of the action bar brings later.
+ */
+final class PanelFrame extends LinearLayout implements BottomReserving {
+    private final View panel;
+    private final View keyboard;
+    private int bottomReserved;
+
+    @Override
+    public void setBottomReserved(int px) {
+        if (px == bottomReserved) {
+            return;
+        }
+        bottomReserved = px;
+        requestLayout();
+    }
+
+    PanelFrame(Context context, View panel, View keyboard) {
+        super(context);
+        this.panel = panel;
+        this.keyboard = keyboard;
+        setOrientation(VERTICAL);
+        // No background: the bar and the keyboard each paint their own, and a colour here would
+        // sit behind a floating panel and cancel the translucency it exists for.
+        addView(panel, new LayoutParams(LayoutParams.MATCH_PARENT, 0, 1f));
+        addView(keyboard, new LayoutParams(
+            LayoutParams.MATCH_PARENT, LayoutParams.WRAP_CONTENT));
+    }
+
+    View panel() {
+        return panel;
+    }
+
+    @Override
+    protected void onMeasure(int widthMeasureSpec, int heightMeasureSpec) {
+        // The window is what the screen leaves an input method: the band the system draws at the
+        // top is not ours to write in, and asking for it put the top of the panel underneath the
+        // status bar and made some apps drop the keyboard the moment it opened (issue #8).
+        int height = PanelHeight.forPanel(getResources().getDisplayMetrics().heightPixels,
+            PanelHeight.topInset(this), bottomReserved);
+        super.onMeasure(widthMeasureSpec,
+            MeasureSpec.makeMeasureSpec(height, MeasureSpec.EXACTLY));
+    }
+}

@@ -1,0 +1,14 @@
+BUILD APK DI HP (GITHUB ACTIONS)
+
+1. Buat repository baru di GitHub.
+2. Upload SEMUA isi folder project ini ke root repository (termasuk folder .github).
+3. Setelah upload selesai, buka tab Actions.
+4. Pilih "Build ReteKey APK".
+5. Tekan "Run workflow" > "Run workflow".
+6. Tunggu sampai build hijau.
+7. Buka hasil run tersebut, scroll ke bagian Artifacts.
+8. Download "retekey-debug-apks".
+9. Ekstrak ZIP artifact di HP. Di dalamnya ada APK modern dan/atau legacy.
+
+Untuk HP Android 9 ke atas, pilih APK dengan nama "modern".
+Debug APK ditandatangani otomatis oleh Android debug key sehingga bisa langsung di-install untuk pengujian.

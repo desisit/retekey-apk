@@ -1,0 +1,2959 @@
+# Android IME Implementation Manual
+
+**English** · [한국어](android-ime-manual.ko.md)
+
+A manual for building an Android input method: how an IME is put together, a minimal working one you
+can copy, the reference implementations worth reading, and then the parts that are hard — the
+editor contract, hardware keys, drawing, theming — each with the failures that shaped them.
+
+It covers only IME implementation, and it is written against real, shipping code: every rule here
+was paid for in this project.
+
+> **This is a living document.** It is updated whenever the IME implementation changes — a new
+> callback, a changed editor interaction, a new pitfall found on a device. If behaviour here no
+> longer matches the code, the document is the thing that is wrong.
+
+## Table of contents
+
+- [1. How an Android IME is put together](#1-how-an-android-ime-is-put-together)
+  - [1.1 The moving parts](#11-the-moving-parts)
+  - [1.2 How the system finds, enables, and selects an IME](#12-how-the-system-finds-enables-and-selects-an-ime)
+  - [1.3 The data flow](#13-the-data-flow)
+  - [1.4 A worked component map](#14-a-worked-component-map)
+- [2. A minimal working IME](#2-a-minimal-working-ime)
+- [3. Reference implementations and where to get them](#3-reference-implementations-and-where-to-get-them)
+- [4. The service lifecycle](#4-the-service-lifecycle)
+- [5. The InputConnection contract](#5-the-inputconnection-contract)
+- [6. The editor is authoritative](#6-the-editor-is-authoritative)
+- [7. Editor kinds and unknown selections](#7-editor-kinds-and-unknown-selections)
+- [8. Composing text](#8-composing-text)
+- [9. Hardware keyboards](#9-hardware-keyboards)
+- [10. The candidates view](#10-the-candidates-view)
+- [11. Drawing a custom keyboard](#11-drawing-a-custom-keyboard)
+  - [11.1 Caching the static image](#111-caching-the-static-image)
+  - [11.2 Touch: from finger to keystroke](#112-touch-from-finger-to-keystroke)
+- [12. Theming](#12-theming)
+- [12a. The window the keyboard lives in](#12a-the-window-the-keyboard-lives-in)
+- [13. Settings and persistence](#13-settings-and-persistence)
+- [14. Testing and verification](#14-testing-and-verification)
+- [15. Anti-patterns, with the failures that taught them](#15-anti-patterns-with-the-failures-that-taught-them)
+- [15a. Remote-desktop editors: a wire with no editor behind it](#15a-remote-desktop-editors-a-wire-with-no-editor-behind-it)
+- [16. Pre-release checklist](#16-pre-release-checklist)
+
+## 1. How an Android IME is put together
+
+### 1.1 The moving parts
+
+An IME is a **service**, not an app screen. Everything else hangs off it.
+
+| Part | What it is | Required? |
+|---|---|---|
+| `InputMethodService` subclass | the IME itself: lifecycle, editor access, key handling | yes |
+| Manifest `<service>` entry | declares the service with `BIND_INPUT_METHOD` and the `android.view.InputMethod` action | yes |
+| `res/xml/method.xml` | IME metadata: label, settings activity, subtypes (languages) | yes |
+| Input view | the on-screen keyboard, from `onCreateInputView()` | no — a hardware-only IME can omit it |
+| Candidates view | a strip above the keyboard, from `onCreateCandidatesView()` | no |
+| Settings activity | ordinary `Activity`, linked from `method.xml` | no, but expected |
+| Launcher activity | to help the user enable/select the IME | no, but expected |
+
+The system side you talk to:
+
+- **`InputConnection`** — your only handle on the app's text. Obtained per-callback with
+  `getCurrentInputConnection()`.
+- **`EditorInfo`** — what the focused field says about itself (input type, IME action, initial
+  selection). Delivered in `onStartInput`.
+- **`InputMethodManager`** — the system service, for things like showing the IME picker.
+
+Two things surprise people coming from app development:
+
+1. **You never touch the app's `View`s.** You cannot read the text field directly; everything goes
+   through `InputConnection`, which is asynchronous and may fail.
+2. **The IME process is separate and long-lived.** It is bound to whichever app has focus, and it
+   survives across apps. A crash takes the keyboard away from the *whole system*, which is why
+   [§15.5](#155-letting-an-exception-escape) matters so much.
+
+### 1.2 How the system finds, enables, and selects an IME
+
+Because an IME can observe everything the user types, Android gates it behind two explicit user
+steps, and **your app cannot perform either of them programmatically**:
+
+1. **Enable** — Settings → *On-screen keyboard* / *Manage keyboards*. Until this happens, the IME
+   does not exist as far as the system is concerned.
+2. **Select** — make it the current input method (the keyboard picker).
+
+What you *can* do is send the user to the right screen:
+
+```java
+// "Manage installed keyboards": the enable step.
+startActivity(new Intent(android.provider.Settings.ACTION_INPUT_METHOD_SETTINGS)
+    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK));
+
+// "Choose keyboard": the select step.
+InputMethodManager imm = getSystemService(InputMethodManager.class);
+if (imm != null) {
+    imm.showInputMethodPicker();
+}
+```
+
+Put both on your launcher screen. A first-run user who cannot find these two switches will conclude
+the keyboard is broken.
+
+For development, the same steps from a shell:
+
+```sh
+adb shell ime list -a              # what the system knows about
+adb shell ime enable  com.example.ime/.MyImeService
+adb shell ime set     com.example.ime/.MyImeService
+```
+
+### 1.3 The data flow
+
+There are two independent input sources, and they arrive at different places:
+
+```
+ ┌──────────────┐  touch      ┌───────────────┐
+ │  input view  │────────────▶│               │
+ └──────────────┘             │               │   commitText / setComposingText
+                              │  your IME     │   deleteSurroundingText / sendKeyEvent
+ ┌──────────────┐  onKeyDown  │   service     │──────────────────────────────▶ ┌────────┐
+ │ hardware key │────────────▶│               │                                │ editor │
+ └──────────────┘             │               │◀────────────────────────────── └────────┘
+                              └───────────────┘   onStartInput(EditorInfo)
+                                                  onUpdateSelection(...)
+```
+
+- **Touch** hits your own view; you decide what it means and call `InputConnection`.
+- **Hardware keys** arrive at `onKeyDown`/`onKeyUp` **before the app sees them**. Returning `true`
+  consumes the key; returning `super.onKeyDown(...)` lets the app have it ([§9](#9-hardware-keyboards)).
+- **The editor talks back** only through `onStartInput` (what kind of field this is) and
+  `onUpdateSelection` (the cursor moved). Everything else you must ask for, and may not get.
+
+A single soft key press in a real IME therefore travels:
+
+```
+touch → key hit-test → semantic event ("jamo ㄱ", "backspace", "raw F5")
+      → composer / dispatcher (may hold state)
+      → a list of editor actions
+      → InputConnection calls
+      → (later, maybe) onUpdateSelection
+```
+
+Keeping those stages separate is what makes an IME testable, because everything before
+"InputConnection calls" can be plain Java ([§14](#14-testing-and-verification)).
+
+### 1.4 A worked component map
+
+ReteKey's structure, as a concrete example of the split above. Names are illustrative; the shape is
+the point.
+
+| Layer | Responsibility | Android-free? |
+|---|---|---|
+| `ReteKeyImeService` | lifecycle, `InputConnection` calls, hardware keys, candidates | no |
+| `ReteKeyboardView` | draw the keyboard, hit-test touches, emit semantic events | no |
+| `KeyboardPalette` | resolve colours from the system/Material You theme | no |
+| `KeyboardLayouts` / `SoftwareKeySpec` | which key sits where, what it means | **yes** |
+| `HangulComposer` / `HangulInputProcessor` | the 2-beolsik automaton and its editor actions | **yes** |
+| `InputDispatcher` / `TransitionPlan` / `KeyAction` | turn events into an ordered list of edits | **yes** |
+| `CheckedEditorExecutor` | run the edits, report what happened | **yes** |
+| `InputConnectionEditorBridge` | the only place that touches `InputConnection` | no |
+| `InputSessionController` | the passive cursor cache ([§6](#6-the-editor-is-authoritative)) | **yes** |
+| `HanjaTable` / `HunumTable` / `HanjaDictionary` | conversion data and lookup | table logic **yes** |
+| `SettingsActivity` / `PreviewActivity` | settings and the enable/select helper screen | no |
+
+The "Android-free?" column is the useful one: **roughly 70% of an IME can be pure Java**, and that
+is the part where the logic bugs live.
+
+## 2. A minimal working IME
+
+This is a complete, working IME: it shows a one-button keyboard that types "A". Start here and grow.
+
+**`AndroidManifest.xml`**
+
+```xml
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application android:label="@string/app_name">
+        <service
+            android:name=".MyImeService"
+            android:label="@string/ime_name"
+            android:permission="android.permission.BIND_INPUT_METHOD"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.view.InputMethod" />
+            </intent-filter>
+            <meta-data
+                android:name="android.view.im"
+                android:resource="@xml/method" />
+        </service>
+    </application>
+</manifest>
+```
+
+`android:permission="android.permission.BIND_INPUT_METHOD"` is what tells the system only it may
+bind this service. Without it — or without the exact `android.view.InputMethod` action — your IME
+never appears in the keyboard list, with no error message.
+
+**`res/xml/method.xml`**
+
+```xml
+<input-method xmlns:android="http://schemas.android.com/apk/res/android"
+    android:settingsActivity="com.example.ime.SettingsActivity"
+    android:supportsSwitchingToNextInputMethod="true">
+    <subtype
+        android:label="@string/subtype_korean"
+        android:imeSubtypeLocale="ko_KR"
+        android:imeSubtypeMode="keyboard"
+        android:isAsciiCapable="false" />
+    <subtype
+        android:label="@string/subtype_english"
+        android:imeSubtypeLocale="en_US"
+        android:imeSubtypeMode="keyboard"
+        android:isAsciiCapable="true" />
+</input-method>
+```
+
+Subtypes are how the system knows which languages you offer; they drive the globe key and
+`onCurrentInputMethodSubtypeChanged`. Mark at least one subtype `isAsciiCapable` or some password
+fields will refuse your IME.
+
+**The service**
+
+```java
+public class MyImeService extends InputMethodService {
+
+    @Override
+    public View onCreateInputView() {
+        Button key = new Button(this);
+        key.setText("A");
+        key.setOnClickListener(v -> commit("A"));
+        return key;                       // any View can be the keyboard
+    }
+
+    private void commit(String text) {
+        InputConnection ic = getCurrentInputConnection();
+        if (ic == null) {                 // always possible
+            return;
+        }
+        ic.commitText(text, 1);
+    }
+}
+```
+
+That is a functioning input method. Everything after this point is about doing it *well*: composing
+text, hardware keys, not breaking terminals, and not crashing.
+
+**Growing it.** The next three steps, in the order that hurts least:
+
+1. Replace the `Button` with a custom `View` that hit-tests a key grid and emits *semantic* events
+   (`"jamo ㄱ"`, `"backspace"`) rather than calling `InputConnection` directly.
+2. Put a plain-Java layer between those events and the edits, so it can be unit-tested.
+3. Only then add a composer, hardware keys, and candidates.
+
+## 3. Reference implementations and where to get them
+
+Read these before inventing anything. The first two are the ones this project actually leaned on.
+
+> **Licence, before you copy anything.** AOSP — LatinIME and the `SoftKeyboard` sample alike — is
+> **Apache-2.0**, not MIT. Reading it and re-implementing an idea carries no obligation, which is
+> all this project does. Pasting a file in does: the Apache header stays, the licence text ships
+> with your app, modified files are marked as changed, and your README can no longer claim the
+> whole app is under your own licence. See
+> [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md).
+
+**AOSP LatinIME** — the Google Keyboard lineage, the most complete open IME for Android, and the
+source of the cursor model in [§6](#6-the-editor-is-authoritative).
+
+```sh
+git clone https://android.googlesource.com/platform/packages/inputmethods/LatinIME
+```
+
+Worth reading in it: `LatinIME.java` (the service), and `RichInputConnection.java` — its
+`mExpectedSelStart` / `mExpectedSelEnd` pair is the passive cursor cache, and its comments are
+candid about how often the editor disagrees.
+
+**AOSP `SoftKeyboard` sample** — the small, official "here is the skeleton" IME. Much easier to read
+end to end than LatinIME, and the right template for §2.
+
+```sh
+git clone https://android.googlesource.com/platform/development
+# samples/SoftKeyboard/
+```
+
+**Official documentation** (titles given too, because these paths move):
+
+- *Create an input method* — the platform guide:
+  <https://developer.android.com/develop/ui/views/touch-and-input/creating-input-method>
+- `InputMethodService`:
+  <https://developer.android.com/reference/android/inputmethodservice/InputMethodService>
+- `InputConnection`:
+  <https://developer.android.com/reference/android/view/inputmethod/InputConnection>
+- `EditorInfo`:
+  <https://developer.android.com/reference/android/view/inputmethod/EditorInfo>
+- `InputMethodManager`:
+  <https://developer.android.com/reference/android/view/inputmethod/InputMethodManager>
+
+**Reading order that works:** the platform guide for vocabulary → `SoftKeyboard` for the skeleton →
+`InputConnection`'s reference page in full (it is short and every paragraph matters) → LatinIME for
+the hard parts.
+
+**This project.** ReteKey itself is MIT-licensed and readable end to end; the Hangul automaton and
+the Hanja tables are ported from a sibling project and credited in `THIRD_PARTY_NOTICES.md`, which
+is also the place to look for the licences of any data you might want to reuse.
+
+## 4. The service lifecycle
+
+The callbacks you will actually implement:
+
+| Callback | When | Use it for |
+|---|---|---|
+| `onCreate` | service created | process-wide setup |
+| `onCreateInputView` | the keyboard view is first needed | build the view, wire callbacks |
+| `onCreateCandidatesView` | the candidates strip is first shown | build the candidate UI |
+| `onStartInput(info, restarting)` | a new editor is attached | classify the editor, reset state |
+| `onStartInputView(info, restarting)` | the keyboard becomes visible | reset transient UI state |
+| `onUpdateSelection(...)` | the editor's cursor moved | update your cursor cache |
+| `onFinishInputView(finishing)` | the keyboard is hidden | finish composing |
+| `onFinishInput` | the editor is detached | finish composing, drop session |
+| `onUnbindInput` | the input binding is dropped | drop session |
+| `onDestroy` | service torn down | release resources |
+
+Also useful:
+
+- `onEvaluateInputViewShown()` — return `false` to hide the on-screen keyboard (for example when a
+  hardware keyboard is attached). Call `super` and combine, do not ignore it.
+- `onEvaluateFullscreenMode()` — return `false` unless you really want the landscape full-screen
+  extract mode.
+- `onCurrentInputMethodSubtypeChanged(subtype)` — the language switched; finish composing
+  ([§8](#8-composing-text)).
+
+**Do not assume the order is the tidy one in the documentation.** Measured on API 33, switching to
+another IME produces:
+
+```
+onUnbindInput → (onDestroy begins) → onFinishInputView → onFinishInput → (onDestroy ends)
+```
+
+That is: **`onUnbindInput` arrives before `onFinishInput`**, and the finish callbacks are *nested
+inside* `onDestroy`. Code that clears the session marker in `onUnbindInput` will then fail to
+attribute its own teardown callbacks. Treat teardown as idempotent: any of these may run first, more
+than once, or with the input connection already gone.
+
+Rules:
+
+- Every teardown path must be safe to run twice.
+- `getCurrentInputConnection()` may return `null` at any time, including inside teardown. Always
+  null-check; never cache the connection across callbacks.
+- Finish composing on **all** of `onFinishInput`, `onFinishInputView`, and
+  `onCurrentInputMethodSubtypeChanged`.
+
+## 5. The InputConnection contract
+
+Everything you do to the editor goes through `getCurrentInputConnection()`.
+
+| Call | Meaning | Notes |
+|---|---|---|
+| `commitText(text, 1)` | insert text at the cursor | replaces the selection if one exists |
+| `setComposingText(text, 1)` | show an underlined preedit | replaces the previous composing region |
+| `finishComposingText()` | make the preedit permanent | no-op when nothing is composing |
+| `deleteSurroundingText(before, after)` | delete relative to the cursor | **does not need to know the cursor position** |
+| `deleteSurroundingTextInCodePoints(b, a)` | same, Unicode-safe | prefer this when deleting user-visible characters |
+| `sendKeyEvent(event)` | deliver a real `KeyEvent` | the only way to send chords and raw keys |
+| `performEditorAction(id)` | run Go/Search/Send | from `EditorInfo.imeOptions` |
+| `performContextMenuAction(id)` | run select-all/copy/paste/undo | works in rich editors, not terminals |
+| `getTextBeforeCursor(n, 0)` | read back text | may return `null`; may be truncated |
+| `getSelectedText(0)` | read the selection | may return `null` or throw in some editors |
+| `beginBatchEdit()` / `endBatchEdit()` | group edits | use for delete-then-commit so the editor sees one change |
+
+Two properties matter more than the rest:
+
+1. **Insertion and relative deletion are cursor-relative.** `commitText`, `setComposingText`, and
+   `deleteSurroundingText` all act at *the editor's* cursor. You never need to know the absolute
+   selection to type or to backspace.
+2. **Every call can fail or be ignored.** They return `boolean` and may throw. Treat a `false` as
+   "this editor did not do it", not as "my state is corrupt".
+
+Replacing a reading with a conversion is a batch:
+
+```java
+ic.beginBatchEdit();
+try {
+    if (deleteLength > 0) {
+        ic.deleteSurroundingText(deleteLength, 0);
+    }
+    ic.commitText(replacement, 1);   // with a live selection this replaces it
+} finally {
+    ic.endBatchEdit();
+}
+```
+
+Sending a real key (the fallback for anything semantic that has no better mapping):
+
+```java
+private void sendRawKey(int keyCode, int metaState) {
+    InputConnection ic = getCurrentInputConnection();
+    if (ic == null) {
+        return;
+    }
+    long now = SystemClock.uptimeMillis();
+    ic.sendKeyEvent(new KeyEvent(now, now, KeyEvent.ACTION_DOWN, keyCode, 0, metaState,
+        KeyCharacterMap.VIRTUAL_KEYBOARD, 0, KeyEvent.FLAG_SOFT_KEYBOARD));
+    ic.sendKeyEvent(new KeyEvent(now, SystemClock.uptimeMillis(), KeyEvent.ACTION_UP, keyCode, 0,
+        metaState, KeyCharacterMap.VIRTUAL_KEYBOARD, 0, KeyEvent.FLAG_SOFT_KEYBOARD));
+}
+```
+
+Always send both `ACTION_DOWN` and `ACTION_UP`, and reuse one `downTime` across the pair, or
+repeat-detection in the target app misbehaves.
+
+## 6. The editor is authoritative
+
+This is the single most important design rule, and the most expensive one to learn.
+
+**The editor owns the text and the cursor. The IME's idea of them is a hint that may be wrong at any
+moment.** Selection updates arrive late, out of order, coalesced, or not at all. Some editors report
+`-1`. Some apply your edit differently from how you predicted.
+
+Therefore:
+
+- Keep a **passive cursor cache**: update it optimistically after your own edit, and let
+  `onUpdateSelection` overwrite it unconditionally. This is the AOSP LatinIME model
+  (`RichInputConnection.mExpectedSelStart` / `mExpectedSelEnd`).
+- **Never** enter a state that refuses input because the cache disagrees with the editor. There must
+  be no "desynchronised" state; if you cannot reconcile, adopt what the editor reported and carry on.
+- Tolerate unknown: `-1` selections are normal, not an error.
+
+```java
+// The whole model. There is no confirmation, no reservation, and no failure state.
+@Override
+public void onUpdateSelection(int oldSelStart, int oldSelEnd,
+                              int newSelStart, int newSelEnd,
+                              int candidatesStart, int candidatesEnd) {
+    super.onUpdateSelection(oldSelStart, oldSelEnd, newSelStart, newSelEnd,
+        candidatesStart, candidatesEnd);
+    if (newSelStart < 0 || newSelEnd < 0) {
+        cursor = EditorBounds.unknown();          // unknown is a normal state
+        return;
+    }
+    cursor = EditorBounds.of(newSelStart, newSelEnd, candidatesStart, candidatesEnd);
+}
+
+// After our own edit we may guess, but the guess has no authority.
+private void afterOwnEdit(EditorBounds predicted) {
+    cursor = predicted;    // overwritten by the next onUpdateSelection, whatever it says
+}
+```
+
+See [§15.1](#151-a-strict-expectation-ledger-that-can-latch) for what happens when you do the
+opposite.
+
+## 7. Editor kinds and unknown selections
+
+Classify the editor once, in `onStartInput`, from `EditorInfo`:
+
+```java
+@Override
+public void onStartInput(EditorInfo info, boolean restarting) {
+    super.onStartInput(info, restarting);
+    boolean rawKeyEditor = info != null
+        && (info.inputType & InputType.TYPE_MASK_CLASS) == InputType.TYPE_NULL;
+    profile = rawKeyEditor ? EditorProfile.rawKeys() : EditorProfile.richText();
+    cursor = (info != null && info.initialSelStart >= 0)
+        ? EditorBounds.of(info.initialSelStart, info.initialSelEnd, -1, -1)
+        : EditorBounds.unknown();     // terminals land here
+}
+```
+
+- `TYPE_NULL` — the editor wants **raw key events**, not text edits. Terminal emulators and some
+  game/console views do this. Send keys with `sendKeyEvent`.
+- Otherwise it is a rich text editor: `commitText` / `setComposingText` are appropriate.
+
+Terminals additionally tend to report `initialSelStart == -1` and never send meaningful
+`onUpdateSelection`. **A keyboard that needs to know the selection cannot type in a terminal.**
+
+Rules:
+
+- Never gate insertion or backspace on having a known selection.
+- Do not assume `performContextMenuAction` works; terminals ignore it.
+- Do not assume the editor has an action; if it has none and is single-line, a real `KEYCODE_ENTER`
+  is the correct fallback ([§15.3](#153-refusing-a-raw-enter)).
+
+Also read `EditorInfo.imeOptions` for the Enter key's meaning:
+
+```java
+int action = info.imeOptions & EditorInfo.IME_MASK_ACTION;
+boolean noEnterAction = (info.imeOptions & EditorInfo.IME_FLAG_NO_ENTER_ACTION) != 0;
+boolean multiLine = (info.inputType & InputType.TYPE_TEXT_FLAG_MULTI_LINE) != 0;
+
+if (!noEnterAction && action != EditorInfo.IME_ACTION_NONE) {
+    ic.performEditorAction(action);          // Go / Search / Send / Done
+} else if (multiLine) {
+    ic.commitText("\n", 1);
+} else {
+    sendRawKey(KeyEvent.KEYCODE_ENTER, 0);   // never do nothing
+}
+```
+
+## 8. Composing text
+
+A stateful composer (Hangul, pinyin, kana) shows an in-progress syllable with `setComposingText` and
+commits it with `finishComposingText` or by committing the next syllable.
+
+A composer step therefore produces an *ordered list* of edits, not one call — this is worth
+modelling explicitly, because it is exactly the part that is unit-testable:
+
+```java
+// "ㄱ" then "ㅏ" then "ㄴ" then "ㄷ":  가 → 간 → commit("가") + compose("ㄴㄷ"→ 낟) …
+List<KeyAction> actions = composer.accept(jamo);
+for (KeyAction action : actions) {
+    switch (action.kind()) {
+        case COMMIT_TEXT:        ic.commitText(action.text(), 1);        break;
+        case SET_COMPOSING_TEXT: ic.setComposingText(action.text(), 1);  break;
+        case DELETE_BACKWARD:    ic.deleteSurroundingTextInCodePoints(1, 0); break;
+        case RAW_KEY:            sendRawKey(action.keyCode(), action.meta()); break;
+    }
+}
+```
+
+**Finish composing at every session boundary.** If the user leaves the field mid-syllable, an
+unfinished preedit is stranded — visually underlined text that belongs to no session, which can
+later reappear or be deleted unexpectedly.
+
+```java
+@Override public void onFinishInput()      { finishComposingInEditor(); /* … */ }
+@Override public void onFinishInputView(boolean finishing) { finishComposingInEditor(); reset(); }
+@Override public void onCurrentInputMethodSubtypeChanged(InputMethodSubtype s) {
+    finishComposingInEditor();   // a language switch must not carry a half-formed jamo across
+    reset();
+}
+
+private void finishComposingInEditor() {
+    InputConnection ic = getCurrentInputConnection();
+    if (ic != null) {
+        ic.finishComposingText();
+    }
+}
+```
+
+When you need the composing text as ordinary text — for example to convert it — the simplest correct
+move is to `finishComposingText()` first, then read it back with `getTextBeforeCursor` and replace
+it. That avoids having to model the composing region yourself.
+
+## 9. Hardware keyboards
+
+Hardware keys arrive at `onKeyDown` / `onKeyUp` / `onKeyMultiple` **before** the application sees
+them. Whatever you return `true` for, the app never receives.
+
+**Pass modifier chords through.** Modifier keys themselves, and any chord holding Ctrl / Alt / Meta,
+are application shortcuts. If the IME swallows them, Ctrl+A / Ctrl+C / Ctrl+V stop working
+everywhere:
+
+```java
+@Override
+public boolean onKeyDown(int keyCode, KeyEvent event) {
+    // 1. Keys the user bound to IME functions must be checked FIRST, before the pass-through,
+    //    or a binding like Right-Ctrl is delegated away before we ever see it.
+    if (event.getRepeatCount() == 0 && handleBoundFunctionKey(keyCode, event)) {
+        return true;
+    }
+    // 2. Modifier keys and Ctrl/Alt/Meta chords belong to the app.
+    if (KeyEvent.isModifierKey(keyCode) || event.isCtrlPressed()
+            || event.isAltPressed() || event.isMetaPressed()) {
+        return super.onKeyDown(keyCode, event);
+    }
+    // 3. Our own handling (jamo mapping, raw keys, …).
+    return handle(keyCode, event) || super.onKeyDown(keyCode, event);
+}
+```
+
+Shift is deliberately *not* in the pass-through test: Shift+letter is ordinary text that the IME
+still composes, and the framework reports the shift meta state on the letter event anyway.
+
+To *send* a chord yourself (a soft Ctrl key, a remapped key), build a real `KeyEvent` with the meta
+state and `sendKeyEvent` it. This works in both worlds: a rich editor turns Ctrl+A into select-all
+via `onKeyShortcut`, a terminal receives the control code.
+
+```java
+sendRawKey(KeyEvent.KEYCODE_B, KeyEvent.META_CTRL_ON | KeyEvent.META_CTRL_LEFT_ON);
+```
+
+**A modifier held on a physical keyboard applies to on-screen keys too.** One hand can hold Ctrl on
+a keyboard while the other taps an arrow on the action bar; that arrow must go out as Ctrl+arrow,
+exactly as the keyboard's own arrow would. The IME sees every modifier key's down and up, so keep a
+record of them — per key code, so that letting go of left Shift while right Shift is down still
+leaves Shift held — and update it on the first line of `onKeyDown` and `onKeyUp`, before any early
+return, or a pass-through path will miss the release:
+
+```java
+@Override
+public boolean onKeyDown(int keyCode, KeyEvent event) {
+    heldHardware.onKey(keyCode, true);          // before anything can return
+    ...
+}
+
+// An on-screen key's modifiers: the soft latches, the bar's, and the physical keyboard's.
+Set<KeyModifier> mods = union(keyboardView.rawKeyModifiers(), heldHardware.held());
+```
+
+Read that set **once, when the finger comes down**, and keep it for the whole press. A key that
+repeats while held otherwise loses a one-shot Ctrl on its first repeat — the latch is spent by the
+first key event — and the rest of the hold goes out bare (§15.32).
+
+**A soft modifier chords by the key's place, not by what it types.** On a physical Korean keyboard
+Ctrl+C is the key that types ㅊ, and that is the key people press. An on-screen page that types jamo
+must map its keys to the Latin letter in the same place before building the chord, or an armed Ctrl
+on the Korean page types ㅊ instead of copying — in every app. ReteKey keeps that table beside the
+layout (`ChordLetters`) and a unit test checks that the 26 letter keys map to 26 different letters.
+
+Left and right modifiers are distinct key codes (`KEYCODE_CTRL_LEFT` = 113,
+`KEYCODE_CTRL_RIGHT` = 114), which is what makes "Right Ctrl toggles the language, Left Ctrl still
+does Ctrl+C" possible.
+
+For a lone-modifier binding, capture it on **key up**: on key down you cannot yet tell whether the
+user is pressing Ctrl alone or starting Ctrl+Space.
+
+```java
+// Capturing a user-assigned shortcut in a settings Activity.
+@Override public boolean onKeyDown(int keyCode, KeyEvent event) {
+    if (!capturing) return super.onKeyDown(keyCode, event);
+    if (KeyEvent.isModifierKey(keyCode)) return true;         // wait: chord, or lone modifier?
+    save(new Binding(modifiersOf(event), keyCode));           // e.g. Shift+Space
+    capturing = false;
+    return true;
+}
+@Override public boolean onKeyUp(int keyCode, KeyEvent event) {
+    if (capturing && KeyEvent.isModifierKey(keyCode)) {
+        save(new Binding(0, keyCode));                        // e.g. Right Ctrl alone
+        capturing = false;
+        return true;
+    }
+    return super.onKeyUp(keyCode, event);
+}
+```
+
+Finally, decide whether the on-screen keyboard should hide while a hardware keyboard is attached:
+
+```java
+@Override
+public boolean onEvaluateInputViewShown() {
+    super.onEvaluateInputViewShown();
+    Configuration config = getResources().getConfiguration();
+    boolean hardware = config.keyboard != Configuration.KEYBOARD_NOKEYS
+        && config.hardKeyboardHidden == Configuration.HARDKEYBOARDHIDDEN_NO;
+    return !hardware;
+}
+```
+
+## 10. The candidates view
+
+`onCreateCandidatesView()` plus `setCandidatesViewShown(true/false)` gives you a strip that is
+independent of the keyboard view. This matters because **the candidates view still shows when the
+input view is hidden** — which is exactly the case when a hardware keyboard is attached. Conversion
+UI belongs here, not in the keyboard view.
+
+The view is created lazily, so populate it in the right order:
+
+```java
+@Override
+public View onCreateCandidatesView() {
+    candidatesView = new CandidatesView(this);
+    candidatesView.setOnPick(this::commitCandidate);
+    if (pendingItems != null) {                 // shown before the view existed
+        candidatesView.show(pendingReading, pendingItems);
+    }
+    return candidatesView;
+}
+
+private void showCandidates(String reading, List<Item> items) {
+    pendingReading = reading;
+    pendingItems = items;
+    setCandidatesViewShown(true);               // may call onCreateCandidatesView now
+    if (candidatesView != null) {
+        candidatesView.show(reading, items);
+    }
+    candidatesShown = true;
+}
+```
+
+Hide the strip when the user types anything else, and on `onStartInput` / `onFinishInputView`, or a
+stale strip will outlive the text it referred to. If you support number-key selection, intercept
+those keys *before* the "any other key hides the strip" rule.
+
+Four rules this project paid for with a strip nobody could see (issue #7, 0.1.170):
+
+- **Showing the strip is not enough to make it visible.** `InputMethodService` lays its candidates
+  frame inside a *full-screen area* whose visibility it sets from the candidates' visibility at the
+  moment the window is laid out. A later `setCandidatesViewShown(true)` changes only the inner
+  frame, so a strip shown after the keys came up sits, switched on and filled in, inside a hidden
+  parent. Walk up from your view and make every hidden ancestor visible when you show it.
+- **Return `View.GONE` from `getCandidatesHiddenVisibility()`.** The default is `INVISIBLE`, which
+  keeps the strip's height; since the candidates view exists for the whole window, not just the
+  editors that use it, every app gets an empty band above the keys.
+- **Call `setCandidatesViewShown` only when the state changes.** Hiding the candidates view while no
+  input view was requested hides the whole window, which takes down any other panel that window was
+  showing — a Hanja list with a hardware keyboard, for one.
+- **A floating keyboard cannot use it.** A floating panel's window covers the screen, so the strip
+  lands at the top of the display under the status bar, and each time it appears the panel below
+  shrinks by its height and the keys resize. Draw the text in the panel itself instead — ReteKey
+  uses the panel's title bar.
+
+```java
+private void revealCandidatesArea() {
+    View decor = getWindow().getWindow().getDecorView();
+    ViewParent parent = strip.getParent();
+    while (parent instanceof View && parent != decor) {
+        View area = (View) parent;
+        if (area.getVisibility() != View.VISIBLE) area.setVisibility(View.VISIBLE);
+        parent = area.getParent();
+    }
+}
+
+@Override public int getCandidatesHiddenVisibility() { return View.GONE; }
+```
+
+None of this shows on a headless emulator's screen. It does show in the view tree: dump the IME
+window's decor view with each view's visibility, size and position (§14), and a parent marked `I`
+above a visible strip is the whole bug.
+
+## 11. Drawing a custom keyboard
+
+A canvas-drawn keyboard redraws on every press. The cost that matters is
+*redraw frequency × per-draw complexity*, so keep the per-frame work proportional to what changed.
+
+### 11.1 Caching the static image
+
+**Cache the static keyboard.** Render the unpressed keyboard — key shapes, bevels, labels — once
+into a `Bitmap`, and on each frame blit the bitmap and draw only the pressed key's overlay:
+
+```java
+@Override
+protected void onDraw(Canvas canvas) {
+    int width = getWidth();
+    int height = getHeight();
+    if (width <= 0 || height <= 0) {
+        return;
+    }
+    ensureBaseBitmap(width, height);              // rebuilt only when the signature changes
+    canvas.drawBitmap(baseBitmap, 0f, 0f, null);
+    drawPressFeedback(canvas, width, height);     // one rounded rect
+}
+
+private void ensureBaseBitmap(int width, int height) {
+    String signature = layoutSignature();
+    if (baseBitmap != null && signature.equals(baseSignature)
+        && baseBitmap.getWidth() == width && baseBitmap.getHeight() == height) {
+        return;                                   // the common case: reuse
+    }
+    if (baseBitmap != null) {
+        baseBitmap.recycle();
+    }
+    baseBitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
+    Canvas cache = new Canvas(baseBitmap);
+    cache.drawColor(palette.background);
+    for (Key key : layout.keys()) {
+        drawKey(cache, key);                      // rounded face + shadow lip + label
+    }
+    baseSignature = signature;
+}
+
+/** Everything the static image depends on — and deliberately NOT the pressed key. */
+private String layoutSignature() {
+    return page + "|" + layoutId + "|" + numpadMode + "|" + shift.isActive()
+        + "|" + shift.isLocked() + "|" + armedModifiers + "|" + isNightMode();
+}
+```
+
+The raised look itself is two rounded rects, which is cheap enough to bake into the cache:
+
+```java
+paint.setColor(palette.keyShadow);                                    // a lip below the face
+canvas.drawRoundRect(l, t + shadowPx, r, b + shadowPx, radius, radius, paint);
+paint.setColor(keyFillColor(key));                                    // the face on top
+canvas.drawRoundRect(l, t, r, b, radius, radius, paint);
+```
+
+Other rules:
+
+- Allocate nothing in `onDraw` — no `Paint`, no `Shader`, no boxing. Reuse fields.
+- Prefer a 1–2 px offset rounded rect for a raised look over `setShadowLayer`, which blurs and is
+  expensive.
+- Recycle the cached bitmap in `onDetachedFromWindow`.
+
+### 11.2 Touch: from finger to keystroke
+
+The touch layer answers three questions, and each one has a wrong answer that feels like a broken
+keyboard rather than a bug: **which key is this**, **whose finger is it**, and **when does it fire**.
+
+**Which key: every pixel belongs to one.** A key is drawn inset by a small gap, and it is tempting
+to hit-test against that visible face so a near-boundary tap cannot reach the neighbour. Don't. The
+gap belongs to the picture, not to the target — inset hit boxes leave a dead band between every
+pair of keys, and on a 240dpi phone that band is a third of the keyboard's area answering nothing
+(§15.16). Hit test against the whole grid cell, with the same edges the drawing uses:
+
+```java
+private int rowAt(KeyboardLayout layout, float y) {
+    int height = getHeight();
+    if (height <= 0 || y < 0.0f || y >= height) {
+        return -1;
+    }
+    return Math.min(layout.rows().size() - 1, (int) (y * layout.rows().size() / height));
+}
+```
+
+**Whose finger: every pointer owns a key.** Typing rolls — the next finger lands before the last
+one lifts — so a view that handles only `ACTION_DOWN` and `ACTION_UP` loses everything pressed in
+between and then releases the *first* finger's key on the final up (§15.11). Handle the masked
+actions, and key the state by pointer id:
+
+```java
+@Override
+public boolean onTouchEvent(MotionEvent event) {
+    int index = event.getActionIndex();
+    switch (event.getActionMasked()) {
+        case MotionEvent.ACTION_DOWN:
+        case MotionEvent.ACTION_POINTER_DOWN:
+            beginTouch(event.getPointerId(index), event.getX(index), event.getY(index));
+            return true;
+        case MotionEvent.ACTION_MOVE:
+            moveTouches(event);                 // every pointer, not getActionIndex()
+            return true;
+        case MotionEvent.ACTION_UP:
+        case MotionEvent.ACTION_POINTER_UP:
+            endTouch(event.getPointerId(index));
+            return true;
+        case MotionEvent.ACTION_CANCEL:
+            cancelAllTouches();
+            return true;
+        default:
+            return true;
+    }
+}
+```
+
+Everything a press carries belongs to the finger, not to the view — the key, the long-press timer,
+the auto-repeat timer, the "a hold already acted" flag, and the grid the indexes were read from:
+
+```java
+private final SparseArray<Touch> touches = new SparseArray<>();
+
+private final class Touch {
+    final int pointerId;
+    final String grid;            // another finger can switch the page mid-press
+    int row;                      // not final: a finger that slides takes the key it slid to
+    int key;
+    boolean holdConsumed;
+    boolean repeatFired;
+    final Runnable onHold = () -> handleLongPress(this);
+    final Runnable onRepeat = () -> handleRepeat(this);
+}
+```
+
+Two guards make that safe. Each timer checks `touches.get(touch.pointerId) != touch` before acting,
+so a callback that outlives its finger does nothing; and `grid` — the page, the layout id, anything
+that changes which cell is where — is compared before the indexes are used, so a finger whose page
+was switched out from under it types nothing instead of typing whatever now sits at `row, key`.
+
+**A finger keeps its key until it clearly leaves it.** A fingertip is never still; it rolls as it
+presses. Re-resolving the key on every move would flip a boundary tap back and forth, and dropping
+the press when the release lands elsewhere loses the keystroke outright. Use hysteresis: the key
+changes only once the finger is a whole touch slop *clear* of its cell.
+
+```java
+/** Whether (x, y) has left the cell [left, right) x [top, bottom) by slop. */
+public static boolean escaped(
+        float x, float y, int left, int top, int right, int bottom, int slop) {
+    return x < left - slop || x > right + slop || y < top - slop || y > bottom + slop;
+}
+```
+
+```java
+if (!escapedKey(layout, touch, x, y)) {
+    continue;                                   // same tap, wobbling
+}
+removeCallbacks(touch.onHold);
+removeCallbacks(touch.onRepeat);
+touch.row = rowIndex;                           // it genuinely went somewhere else
+touch.key = keyIndex;
+armTimers(touch, layout.rows().get(rowIndex).get(keyIndex));
+```
+
+**When it fires: on release, for whatever key the finger is on.** Do not hit-test the release —
+moves already decided the key, and a second test is only a second chance to disagree. Skip the tap
+when a hold or a repeat already acted for that finger:
+
+```java
+if (touch.holdConsumed || touch.repeatFired) {
+    return;
+}
+SoftwareKeySpec held = layout().rows().get(touch.row).get(touch.key);
+```
+
+Held-key auto-repeat is a `postDelayed` loop that re-fires the held key and re-posts itself; cancel
+it in every path that ends the press — release, cancel, retarget, and any layer reset.
+
+**Showing what a gesture would do.** A drag is invisible until it happens, so the keys that answer
+to one say so under a held finger: a guide of the four letters around the key with what it holds in
+the middle, the way the finger has gone lit up. Holding waits — it types on release, whichever cell
+is lit — while a quick drag types at once and raises the same guide with its choice already made,
+so the gesture is explained rather than merely obeyed. The guide is drawn over the cached keyboard
+in `onDraw`, clamped inside the view so a key at the edge does not push it off:
+
+```java
+float centreX = Math.min(Math.max((cellLeft + cellRight) * 0.5f, step + box * 0.5f),
+    width - step - box * 0.5f);
+```
+
+Keep what the guide promises and what the gesture delivers in one place. Here a static
+`flickLabel(key, direction)` answers the guide and the automaton answers the press, and a test walks
+every key and every direction asserting the two agree — otherwise the picture drifts from the code
+and the keyboard starts lying to the user.
+
+**What can and cannot be tested.** Keep the geometry and the hysteresis in Android-free classes and
+they are ordinary JVM tests: sample every few pixels of every layout and require a key at each one,
+and assert the slop rule directly at, on, and past the boundary. What no test reaches is the thing
+that caused the bug — `adb shell input` injects one pointer at a time, so genuine two-finger overlap
+cannot be reproduced from a shell. Keep the per-pointer state small enough to be obviously right by
+reading, and check the overlap by hand on a device.
+
+
+## 12. Theming
+
+Resolve colours from the device theme; do not hardcode them.
+
+```java
+static KeyboardPalette resolve(Context context) {
+    boolean night = (context.getResources().getConfiguration().uiMode
+        & Configuration.UI_MODE_NIGHT_MASK) == Configuration.UI_MODE_NIGHT_YES;
+
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+        try {                                    // Material You: match the user's own palette
+            return night
+                ? new KeyboardPalette(
+                    color(context, android.R.color.system_neutral1_900),   // background
+                    color(context, android.R.color.system_neutral1_700),   // key face
+                    color(context, android.R.color.system_accent1_300),    // active key
+                    color(context, android.R.color.system_neutral1_50))    // label
+                : new KeyboardPalette(
+                    color(context, android.R.color.system_neutral1_100),
+                    color(context, android.R.color.system_neutral1_50),
+                    color(context, android.R.color.system_accent1_600),
+                    color(context, android.R.color.system_neutral1_900));
+        } catch (RuntimeException useStatic) {
+            // fall through
+        }
+    }
+    return night ? DARK : LIGHT;                 // tuned fallback for older versions
+}
+```
+
+Rules:
+
+- Honour light/dark via `UI_MODE_NIGHT_MASK`.
+- Assign colours by Material role — background as surface, keys as an elevated surface, labels as
+  on-surface, active keys as primary, press as a primary state layer — rather than picking hues.
+- Include the theme in your draw-cache key ([§11](#11-drawing-a-custom-keyboard)) so a light/dark
+  switch rebuilds the keyboard.
+- Use one palette for every surface you draw: keys, long-press popup, candidate strip.
+
+### Letting the user override the system
+
+Following the system is the right default, not the whole answer: a user who keeps their phone in
+light mode may still want a dark keyboard, and there is nowhere else for them to ask for it. The
+override is one stored word — `system`, `light`, `dark` — read in exactly two places:
+
+```java
+enum ThemeMode { SYSTEM, LIGHT, DARK;
+    boolean night(boolean systemNight) { ... }   // only SYSTEM consults the device
+}
+
+static boolean isNight(Context context) {        // the palette's one question
+    return ScreenTheme.mode(context).night(systemNight(context));
+}
+```
+
+Rules that came out of building it:
+
+- **Store the word, not the ordinal.** An ordinal renames everyone's stored choice the day a mode
+  is inserted in the middle of the enum; an unknown word can fall back to `SYSTEM`, which is what
+  every version before the setting existed did.
+- **The keyboard needs no new plumbing.** It already re-reads preferences on change and already has
+  the theme in its draw-cache key; put the mode in that key too, and a switch repaints by itself.
+- **Your own activities are the awkward half.** They are made of stock views and take their colours
+  from the activity theme, not from your palette. `createConfigurationContext` is API 17 and
+  `DayNight` is API 29, so on an app that reaches further down, pick the theme resource instead —
+  the day/night one for `SYSTEM`, a fixed light or dark parent otherwise — in `onCreate` **before**
+  `super.onCreate`, and `recreate()` when the choice changes.
+- **An activity that was only paused keeps the old theme.** The screen the user came from is still
+  alive when they return; compare the mode it was built with in `onResume` and recreate if it moved.
+
+
+## 12a. The window the keyboard lives in
+
+An IME window is a `Dialog` (`SoftInputWindow`), and it is not padded for the system's own furniture
+the way an activity is. Most ROMs draw two buttons under an open keyboard — hide the keyboard, and
+switch keyboard — and an app that targets a recent SDK is drawn edge to edge, so the window reaches
+the physical bottom of the screen and those buttons sit on top of the bottom key row.
+
+**This is not cosmetic.** The system takes the touch first, so the keys underneath cannot be pressed
+at all. ReteKey shipped that way until a user reported it: the `!#` and layout keys were unreachable
+on One UI.
+
+```java
+// Reserve the band the system takes taps in, as padding under the keys.
+int band = Build.VERSION.SDK_INT >= 29
+    ? insets.getTappableElementInsets().bottom     // 0 under gesture navigation
+    : insets.getSystemWindowInsetBottom();         // API 20-28
+setPadding(0, 0, 0, band);
+```
+
+Rules:
+
+- Reserve the **tappable-element** inset, not the navigation bar's. Under gesture navigation the bar
+  reports a height for its handle while nothing there takes a tap; padding by the bar would throw
+  away a strip of keyboard for nothing.
+- Add the band **below** the keys rather than taking it out of them, or a user who turns the buttons
+  on finds their keyboard has silently shrunk.
+- Ask once on attach as well as listening for changes: the insets may have settled before the input
+  view existed, and a listener only fires on a change.
+- Do not consume the insets — other views in the window are entitled to the same answer.
+- Clamp what you apply. A wrong inset arriving mid-resize would otherwise leave no keys at all.
+- Keep every `WindowInsets` reference in one class if the app still runs on API 14–19, where the
+  type does not exist.
+
+**A panel the keyboard owns is not entitled to the whole screen.** An IME window is anchored to the
+bottom, so a window measured at the full display height reaches up behind the status bar — and an
+app whose own area is squeezed to nothing by it can decide the keyboard is in the way and put it
+down, which is a panel that opens and closes in the same breath (§15.52). Measure a panel against
+what is actually there: the screen, less the band at the top the system draws in, less whatever the
+keyboard already reserves at the bottom, and never more than four fifths of the screen. That is
+arithmetic, so it belongs in a class a unit test can call rather than in a layout pass.
+
+**A floating panel lives in a window the size of the screen.** Two consequences:
+
+- The touchable region you hand the framework in `onComputeInsets` is in **window** coordinates. A
+  panel's bounds are its own; offset them by `getLocationInWindow`, because anything the framework
+  adds above the input view — a candidates strip — moves the panel down, and the region would
+  otherwise answer touches that far above the keys.
+- **The whole title bar is the move handle.** A small handle at one end of a bar that is mostly
+  empty is a target people miss. Every part of the bar that is not a key (cross over, close, resize)
+  starts a move (0.1.171).
+
+## 13. Settings and persistence
+
+The settings screen is an ordinary `Activity` named in `method.xml`. The only structural point is
+that **the service and the activity are different processes' worth of state in the same process**,
+and the keyboard must notice changes:
+
+```java
+// In the keyboard view: read on attach, and follow later edits.
+private final SharedPreferences.OnSharedPreferenceChangeListener prefsListener =
+    (prefs, key) -> reloadPreferences();
+
+@Override protected void onAttachedToWindow() {
+    super.onAttachedToWindow();
+    prefs().registerOnSharedPreferenceChangeListener(prefsListener);
+    reloadPreferences();
+}
+
+@Override protected void onDetachedFromWindow() {
+    prefs().unregisterOnSharedPreferenceChangeListener(prefsListener);
+    super.onDetachedFromWindow();
+}
+```
+
+Without the listener, a setting changed while the keyboard is alive only takes effect the next time
+the view is created — which users read as "the slider does nothing".
+
+Keep the clamping of stored values in plain Java so it is unit-testable, and clamp on **read** as
+well as write; preference files outlive your validation rules.
+
+Two kinds of thing end up in settings that are worth naming, because both are read by the keyboard
+rather than by the screen that writes them:
+
+- **What a drawing rule needs.** The box that echoes the last keystroke is a switch and an opacity;
+  the opacity has a floor for its ink, because a box that fades its letters with its background stops
+  being a readout before it stops being visible (§15.50, §15.51).
+- **What the user brought with them.** The layout somebody wrote themselves is stored as the text of
+  the file, parsed on the way in and again when the service starts, and held in one slot — one
+  layout, replaced when another arrives. Storing the text rather than the parsed form is what lets a
+  later version read an old file better than the version that stored it. The format, and what it
+  deliberately does not say, is a document of its own: `docs/user-layouts.md` (§15.47).
+
+## 14. Testing and verification
+
+**Keep the input core Android-free.** Event normalisation, layout geometry, the composer automaton,
+dictionaries, and settings clamping can all be plain Java, and then they are unit-testable on the
+JVM with no device. This is where nearly all real logic bugs are caught.
+
+Also test the **shipped data**, not just fixtures: parse the real dictionary file in a unit test and
+assert a few known conversions, so a bad regeneration fails the build.
+
+```java
+@Test public void shippedDataConvertsCommonReadingsAndWords() {
+    HanjaTable table = HanjaTable.parse(Files.readAllLines(
+        Paths.get("src/main/assets/hanja.txt"), StandardCharsets.UTF_8));
+    assertTrue(table.candidates("가").contains("家"));
+    assertTrue(table.candidates("학교").contains("學校"));   // word entry, longest match
+}
+```
+
+**Do not trust a headless emulator as an oracle for IME behaviour.** Two failure modes were measured
+repeatedly on a headless, no-KVM emulator:
+
+- The IME window reports `Requested w=0 h=0`, `mViewVisibility=GONE`, `mHasSurface=false`, and
+  `screencap` returns a blank framebuffer — *even for a build known to work on a real device.* You
+  cannot conclude "the keyboard does not show" from this.
+- Injected key events (`adb shell input keyevent`) may not reach the IME's `onKeyDown` at all, and
+  the result is not even stable between runs.
+
+What a headless emulator *can* prove: the APK installs, the IME registers and can be selected,
+activities inflate, and nothing crashes. Useful commands:
+
+```sh
+adb shell ime list -a
+adb shell settings get secure default_input_method
+adb shell dumpsys input_method | grep -E "mInputShown|mServedView|mCurMethodId"
+adb logcat -d | grep -E "FATAL|AndroidRuntime"
+```
+
+Anything visual or input-interactive must be verified on a real device. When a regression appears,
+build a **known-good tag** and install it on the same emulator: if the known-good build produces
+identical symptoms, the symptom is the environment, not your change.
+
+**An instrumentation build turns the emulator into a measuring instrument.** It cannot show the
+keyboard, but it can press it and read back what happened. ReteKey keeps a gitignored
+`instrumentation` source set whose service subclass registers a broadcast receiver; each command
+below was added to settle a question this manual now answers:
+
+- **Type through the real soft path.** Hand `dispatchSoftwareInput` the event a touch would have
+  produced (`keys=cho0,jung0,RAW:C:CTRL`), with a gap between keys so editor reports interleave as
+  they do under a thumb. Read the result back from the editor — a file the shell wrote in Termux
+  (`run-as com.termux cat`), or a field's text and selection by reflection.
+- **Photograph the IME window without a surface.** `decor.draw(new Canvas(bitmap))` renders the
+  window's views into a bitmap you can pull and look at; a dump of the view tree (class, visibility,
+  size, position) explains what the picture shows. This is how the invisible strip and the floating
+  panel's layout were seen (§10).
+- **Touch the IME's own views.** `MotionEvent`s dispatched to an action-bar slot or a floating frame
+  run the real touch code — tap, hold, repeat, drag — which `adb input` cannot reach.
+- **Hold a physical key.** Call `onKeyDown`/`onKeyUp` with a modifier and leave it down between
+  commands; `adb input keyevent` times out under TCG and cannot hold anything.
+- **Read and write the clipboard** from the IME process, which Android allows for the current IME.
+
+For a remote desktop, measure the far side too: the Microsoft client installed on the emulator,
+connected to a Windows VM, with a scheduled task in the logged-on session reading or setting the
+session's clipboard and a screenshot taken inside the guest (§15a.7, §15a.8). What the emulator
+still cannot tell you is how a real finger and a real screen behave — size, feel, and whether a
+strip is legible — so those stay on the device checklist.
+
+**Type every cell of the interaction matrix, not the one you changed.** Most defects this keyboard
+shipped lived in a combination nobody typed: a syllable redrawn in a terminal, a key passed through
+mid-syllable, an arrow pressed right after a syllable. Two matrices now run them together:
+
+- `InteractionMatrixTest` (JVM, every build): five editor kinds — rich text, remote desktop,
+  terminal with the strip, terminal drawn, Termux's text mode — × fourteen ways of typing, each
+  ending in one expected screen that every editor must show. The keys go through the real
+  dispatcher, composer and executor; the editors are models in `SimulatedEditors`, each rule citing
+  the behaviour it copies; the parts of the service a JVM cannot run (passing a key through, leaving
+  the field, reacting to a selection report) are reproduced with a pointer to the method each
+  copies. It prints the whole table and names every failing cell.
+- `scripts/interaction-matrix.sh` (emulator lane, instrumentation build, about twenty minutes under
+  TCG): the cells only a real editor and a real IME window answer — real Termux in both modes, the
+  strip's view tree, the notepad and the clip list opening inside a terminal and staying open, paste
+  into an app that is a terminal by name, touches on the action bar with physical modifiers held,
+  the phonetic page, installing a layout from a file, the pads. It prints a PASS/FAIL table and exits
+  with the number of failing cells (sixty-six as of v0.1.192).
+
+**The lane boots wiped, so the terminal has to be reinstalled every time.** `emulator-lane.sh`
+starts the emulator with `-wipe-data`, which is what keeps one run from leaning on the last, and it
+also means Termux is gone at every boot: keep an APK where the matrix can find it (it looks for one
+at a fixed path and installs it if the package is missing) or the whole terminal half is skipped —
+silently, as far as a passing table is concerned. Termux's own release build is **not debuggable**,
+so `run-as com.termux` cannot read the files a cell wrote; the lane's AOSP image gives `adb root`,
+which can, and the script tries run-as first and falls back to reading the data directory directly.
+Reinstalling the IME while its window is on screen makes the framework throw `View=DecorView
+[InputMethod] not attached to window manager` from `showWindow` — an artefact of the reinstall, not
+a defect: force-stop the IME and start the app again before believing a crash seen that way.
+
+**Test the documentation that tells somebody else how to write a file.** A format is only as good as
+the description people copy from, and a description drifts silently. The examples in
+`docs/user-layouts.md` are extracted by a unit test and parsed, the translation has to carry the same
+examples byte for byte, and the first of them is the very string the settings screen displays — so
+the page on the phone, the page on the web and the parser cannot disagree (§15.47).
+
+**Prove a matrix catches something.** When a cell is added for a defect, run it once against the
+code before the fix and see it fail; a cell that has only ever passed may be testing its own model.
+And when a cell fails, reproduce it on a real editor before trusting it: the first run of the JVM
+matrix failed twelve cells, of which the Enter row was the model's fault (a multi-line field asks
+for no Enter action) and the rest were a real defect (§15.34).
+
+## 15. Anti-patterns, with the failures that taught them
+
+### 15.1 A strict expectation ledger that can latch
+
+**What was built.** Every edit reserved an "expectation" in a ledger; `onUpdateSelection` had to
+confirm it. A contradiction called `desynchronize()`, which moved the session to a
+`DESYNCHRONIZED` state — and every subsequent key was refused from that state.
+
+**What happened.** In a terminal, `onUpdateSelection` reports unknown bounds, which counts as a
+contradiction. So: type a few characters, hit the first unknown update, latch, and the keyboard is
+dead for the rest of the session. The bug was reported three times as *"it types a few characters
+then stops"* and patched three times by closing one door at a time.
+
+**The fix.** Delete the layer. A passive cursor cache with no confirmation, no reservation, and no
+failure state. Input can never be refused because of internal bookkeeping.
+
+```java
+// Wrong: bookkeeping can refuse input.
+if (state == DESYNCHRONIZED) {
+    return ExecutionResult.notDispatched(Reason.SESSION_DESYNCHRONIZED);
+}
+
+// Right: there is no such state; unknown just means unknown.
+cursor = reported.isKnown() ? reported : EditorBounds.unknown();
+```
+
+**Rule.** If a code path can answer "I refuse to type because my model is unsure", that path is a
+bug. Delete the state that makes the answer possible.
+
+### 15.2 Gating insertion on a known selection
+
+**What was built.** `commitText` and `setComposingText` were rejected with `INVALID_SELECTION` when
+the cached bounds were unknown.
+
+**What happened.** Terminals report `-1`, so every keystroke was dropped and a failure toast fired
+on each one — the keyboard looked completely broken in that app.
+
+**The fix.** Insertion is cursor-relative and needs no bounds. The same applies to
+`deleteSurroundingText`: backspace was also gated on a known selection and also failed in terminals
+until the gate was removed entirely.
+
+```java
+// Wrong.
+if (!bounds.hasSelection()) {
+    return refuse(Reason.INVALID_SELECTION);
+}
+ic.commitText(text, 1);
+
+// Right: the editor knows where its own cursor is.
+ic.commitText(text, 1);
+```
+
+**Rule.** Only operations that address *absolute* positions may require a known selection — and in
+practice you should not have any.
+
+### 15.3 Refusing a raw Enter
+
+**What was built.** Enter resolved to an editor action; for a single-line editor with no action it
+produced an empty result and did nothing. Raw Enter was additionally refused for "rich" editors.
+
+**What happened.** Enter did nothing at all in terminals — no newline, no submit.
+
+**The fix.** Fall through to a real `KEYCODE_ENTER` via `sendKeyEvent`. Every editor understands a
+real Enter key: a terminal submits the line, a plain field does its default. See the Enter cascade in
+[§7](#7-editor-kinds-and-unknown-selections).
+
+**Rule.** For any key with a "semantic" mapping, keep a raw-key fallback. Doing nothing is never the
+right answer for a key the user pressed.
+
+### 15.4 Re-anchoring the composer on any prediction mismatch
+
+**What was built.** On `onUpdateSelection`, if the reported cursor differed from the predicted one,
+the composer called `finishComposingText()` and reset — intended to re-anchor after the user tapped
+elsewhere.
+
+**What happened.** Real editors do not match the prediction exactly. The mismatch fired on the
+IME's *own* edits, so every keystroke triggered finish+reset, plausibly re-entering
+`onUpdateSelection`, and the IME died: **the keyboard stopped appearing at all.** This shipped and
+had to be reverted.
+
+```java
+// Wrong: a prediction mismatch is not evidence of anything.
+if (!reported.equals(predicted)) {
+    ic.finishComposingText();
+    composer.reset();
+}
+
+// Right: only an unambiguous signal re-anchors — the cursor left the composing region.
+if (composer.isComposing() && !composingRegion.contains(reported.start())) {
+    ic.finishComposingText();
+    composer.reset();
+}
+```
+
+**Rule.** Never drive destructive state changes from a prediction mismatch. Predictions are hints;
+only unambiguous evidence should reset user-visible state.
+
+### 15.5 Letting an exception escape
+
+**What happened.** An exception thrown while handling a key or a selection update killed the IME
+process, and the keyboard vanished mid-typing — for every app, not just the one that misbehaved.
+
+**The fix.** Wrap the editor-facing entry points and degrade instead of propagating:
+
+```java
+try {
+    execute(dispatcher.dispatch(event));
+} catch (RuntimeException crash) {
+    dispatcher.reset();
+    inputProcessor.reset();   // lose the half-formed syllable, keep the keyboard alive
+}
+```
+
+**Rule.** A misbehaving editor must never be able to take the keyboard down. Losing a syllable is
+acceptable; losing the keyboard is not.
+
+### 15.6 Swallowing application shortcuts
+
+**What happened.** The IME consumed modifier chords, so Ctrl+A / Ctrl+C / Ctrl+V did nothing in any
+app while the keyboard was active.
+
+**The fix.** Delegate modifier keys and Ctrl/Alt/Meta chords to `super.onKeyDown` — except the
+specific chords the user has bound to IME functions, which must be checked first
+([§9](#9-hardware-keyboards)).
+
+### 15.7 Mapping a soft modifier to editor commands only
+
+**What was built.** A soft Ctrl combined with a letter was mapped to context-menu actions, but only
+for `a/c/v/x/z/y`. Every other letter fell through and was typed as text.
+
+**What happened.** In a terminal, Ctrl+B inserted the literal character `b` instead of sending
+`0x02`.
+
+**The fix.** Send a real key chord for *any* letter. Rich editors handle Ctrl+A/C/V/X/Z/Y through
+`onKeyShortcut`, and terminals get their control codes — one mechanism instead of a special-case
+table.
+
+```java
+// Wrong: a table of effects that only covers what you thought of.
+int id = contextMenuIdFor(letter);      // a→selectAll, c→copy, … else 0
+if (id != 0) ic.performContextMenuAction(id); else ic.commitText(letter, 1);
+
+// Right: emit the real event and let each editor interpret it.
+sendRawKey(keyCodeForLetter(letter), KeyEvent.META_CTRL_ON | KeyEvent.META_CTRL_LEFT_ON);
+```
+
+**Rule.** Prefer emitting the real input event over simulating its effect. The event works in more
+places than your table of effects.
+
+### 15.8 Rebuilding the whole keyboard image per keystroke
+
+**What it costs.** Gradients, shadows, and text for 30–40 keys recomputed on every press, on the UI
+thread, for a change that affects one key.
+
+**The fix.** [§11](#11-drawing-a-custom-keyboard) — cache the static image, redraw one key. Keep the
+pressed key out of the cache key, or you have cached nothing.
+
+### 15.9 Hardcoding colours
+
+**What happened.** A fixed palette looked wrong the moment the system switched to dark mode, and
+ignored the user's theme entirely.
+
+**The fix.** [§12](#12-theming) — resolve from the theme, and include the theme in the cache key.
+
+### 15.10 Trusting the emulator
+
+**What happened.** A headless emulator showed a zero-sized, never-rendered IME window and dropped
+injected key events, which was mistaken for a code regression. Building a known-good tag and
+installing it on the same emulator reproduced the identical symptoms, proving the environment was at
+fault.
+
+**Rule.** Before concluding "the keyboard is broken", reproduce with a build that is known to work.
+See [§14](#14-testing-and-verification).
+
+### 15.11 Listening only to the first and last pointer
+
+**What happened.** `onTouchEvent` handled `ACTION_DOWN` and `ACTION_UP` and nothing else. Typing
+quickly *rolls* — the next finger lands before the last one lifts — and those presses arrive as
+`ACTION_POINTER_DOWN`, which fell through to `default` and was ignored. Every key pressed while
+another finger was still down was silently lost, and worse, the eventual `ACTION_UP` released the
+*first* finger's key, so a ㅅ pressed during a ㅈ came out as ㅈ. It reads as the keyboard eating
+input, and no test that injects one tap at a time can see it.
+
+**The fix.** Give every pointer its own key, with its own timers:
+
+```java
+case MotionEvent.ACTION_DOWN:
+case MotionEvent.ACTION_POINTER_DOWN:
+    beginTouch(event.getPointerId(index), event.getX(index), event.getY(index));
+    return true;
+case MotionEvent.ACTION_UP:
+case MotionEvent.ACTION_POINTER_UP:
+    endTouch(event.getPointerId(index), event.getX(index), event.getY(index));
+    return true;
+```
+
+```java
+private final SparseArray<Touch> touches = new SparseArray<>();
+
+private final class Touch {
+    final int pointerId; final int row; final int key;
+    boolean holdConsumed; boolean repeatFired;
+    // Two thumbs means two of these at once, so the long-press and repeat timers cannot be
+    // fields on the view.
+    final Runnable onHold = () -> handleLongPress(this);
+    final Runnable onRepeat = () -> handleRepeat(this);
+}
+```
+
+Each timer checks `touches.get(touch.pointerId) != touch` before acting, so a callback that fires
+after its finger has lifted does nothing. The press highlight draws every held key, not one.
+
+**Rule.** A keyboard may draw one highlight, but it must *hear* every pointer. Anything the view
+keeps per press — the held key, the long-press timer, the repeat timer, the "a hold already acted"
+flag — belongs to the finger, not to the view. And note what cannot be tested this way: adb injects
+one pointer at a time, so the overlap that causes the bug cannot be reproduced from a shell. Keep
+the per-pointer state small enough to be obviously right by reading.
+
+### 15.12 Throwing away the meaning of a repeat
+
+**What happened.** Holding a key on a Bluetooth keyboard typed one character and then went silent.
+The platform delivers a held key as further `ACTION_DOWN`s with a rising `getRepeatCount()`, and two
+layers independently discarded them: the event normaliser refused to attach semantic input to
+anything with `repeatCount != 0`, and the dispatcher answered a tracked repeat with "handled, no
+actions" — swallowed, so the editor never saw it either.
+
+**Rule.** A repeat is a keystroke. If you consume the first press you must consume and *act on* the
+repeats, or delegate both. Half of each is the one combination that loses input.
+
+### 15.13 Assuming backspace deletes what you last added
+
+**What happened.** A 12-key mode replaces the jamo on screen by sending backspace and then the
+successor — the natural way to express "that tap turned ㅗ into ㅜ". It worked until compound
+vowels: the composer *decomposes* a compound medial rather than removing it, so 과 backspaces to 고,
+not to ㄱ. The replacement then landed next to a leftover vowel and ㆍㅡㅣㆍ produced 고ㅘ instead of
+과.
+
+**Rule.** If you drive a composer by deleting and re-adding, you own its deletion semantics too.
+Know which jamo decompose and delete twice for them — and test through the composer into editor
+text, not just at the interface between your layers. Table-level tests passed the whole time.
+
+### 15.14 A glyph the device has no font for
+
+**What happened.** The menu key was drawn as `☰`. On Android 4.4 the canvas drew *nothing*: the
+platform has no font covering it, so the key was an empty cell. The same was true of most of the
+symbol labels. No test could see this — it was found by taking a screenshot.
+
+**Rule.** On old platforms, prefer a short word to a glyph you have not seen render there. Keep the
+substitution in one table keyed by API level, so the layout keeps its glyph and only the painting
+changes. And screenshot the oldest version you support: a blank key is invisible to every assertion
+you will think to write.
+
+### 15.15 Parsing a dictionary that could have stayed on disk
+
+**What happened.** 190 KB of Hanja tables became about 2.6 MB of Java heap once every entry was a
+`String` in a `HashMap` — an object header and a char array for each of some twenty thousand keys
+and values, to answer lookups that touch one of them at a time.
+
+**The fix.** Ship the tables sorted, store them uncompressed so they can be mapped
+(`androidResources { noCompress += ["idx"] }`), and bisect the mapped bytes in place. The data never
+enters the heap: the pages are file-backed and clean, so the kernel drops them under pressure and
+reads them back when a lookup touches them again.
+
+**Rule.** A lookup table that is read far more often than it changes belongs on disk, not in a map.
+When you generate the shipped form, test that it answers exactly what the old form answered — on
+every entry, in every direction. That comparison is what caught a candidate ordering difference here.
+
+### 15.16 A touch target with holes in it
+
+**What happened.** Each key is drawn inset by a 4dp gap, and the hit test used the same inset:
+a touch that landed in the gap registered nothing, so that "a near-boundary tap cannot land on the
+wrong neighbour". On a 240dpi phone the gap is 6px and a cell is 48x70px, so the dead band between
+two keys is 12px of every 48 across and 12 of every 70 down - **about a third of the keyboard's
+area typed nothing at all**. It never looks like a bug. It looks like the keyboard is unresponsive,
+and the user presses harder.
+
+Two smaller holes went with it. A release was hit-tested again and dropped unless it landed on the
+same key it started on, so the roll of a fingertip cancelled the keystroke; and moves were not
+listened to at all, so the finger's key could never follow it.
+
+**The fix.** Every pixel belongs to a key - the gap is in the picture, not in the target. A finger
+keeps the key it started on until it is a whole touch slop *clear* of that key's cell, and then
+takes the key it moved onto:
+
+```java
+public static boolean escaped(
+        float x, float y, int left, int top, int right, int bottom, int slop) {
+    return x < left - slop || x > right + slop || y < top - slop || y > bottom + slop;
+}
+```
+
+Release then types whatever key the finger is on. Where it lifts is not a second chance to
+disagree.
+
+**Rule.** A visual gap is not a touch gap. Never subtract from a hit box to prevent a wrong key -
+you trade a rare wrong letter for a common missing one, and the missing one is what people feel.
+Prefer hysteresis (a slop the finger must exceed) over a dead zone (an area that answers nothing),
+and let the target tile the surface with no space left over. A unit test can assert exactly that:
+sample every few pixels of every layout and require a key at each one.
+
+### 15.17 A syllable committed before the letter was finished
+
+**What happened.** 나랏글 could not spell 많. The 12-key automata reach most letters by transforming
+what is already on screen — ㅇ then 획추가 is ㅎ — so the keyboard types a letter *before* it knows
+what that letter will be. By the time the stroke arrives, the composer has already seen ㅇ, decided
+that ㄴ + ㅇ is not a compound final, committed 만 to the editor, and started a new syllable. The
+stroke's delete-and-retype then produced 만 ㅎ, because the ㅎ had nothing left to attach to: the
+syllable it belonged to was no longer the composer's to change.
+
+Compound finals typed outright were fine all along — 값, 삶, 닭 — which is why the tables looked
+innocent. Every 겹받침 whose tail needs a transform was unreachable: 많, 않, 앉, 옳, 핥.
+
+**The fix.** Distinguish the two reasons a keyboard deletes. A user's backspace means *undo what I
+see*; an automaton's means *take back the letter I typed, I am about to say what it really was*.
+The second one is allowed to re-open the syllable the composer closed a moment ago:
+
+```java
+public Result reopenClosedSyllable() {
+    if (closedSyllable == null || state != State.CHO) {
+        return null;
+    }
+    cho = closedSyllable[0];
+    jung = closedSyllable[1];
+    jong = closedSyllable[2];
+    state = jong > 0 ? State.CHO_JUNG_JONG : State.CHO_JUNG;
+    closedSyllable = null;
+    return preedit(syllable());
+}
+```
+
+The composer remembers the syllable a consonant pushed out, for exactly one input — any other input
+clears it, so only the transform that immediately follows can use it. The processor spends it as
+three editor actions: clear the consonant being corrected, take the committed syllable back out of
+the editor, and put it into composition again. The replacement then joins it by the ordinary
+compound-final rule, and 많 assembles itself.
+
+**Rule.** When a keyboard types letters it may still revise, "commit" is a promise it cannot yet
+make. Either delay the commit or keep a way to take it back — and make the two kinds of delete
+different values in the vocabulary rather than the same one, because the automaton knows something
+the user's backspace does not. Test this where the syllables are, not where the jamo are: the jamo
+tables were right the whole time.
+
+### 15.18 A gesture that only exists while the finger is moving
+
+**What happened.** A drag off a key was recognised in `ACTION_MOVE`: once the finger passed the
+threshold, the dragged letter went in. It worked under a thumb and failed under `adb shell input
+swipe` at short durations — the injected stroke arrived as a down and an up with no move in
+between, so the keyboard typed the key's tap letter instead. The same gap exists for a real finger
+whenever the system coalesces a fast stroke.
+
+**The fix.** Judge the gesture in both places. The move handler still fires it the instant the
+finger crosses the line, which is the whole point of dragging rather than tapping twice; the
+release checks the same thing again for a stroke that reported nothing on the way:
+
+```java
+if (tryFlick(layout(), touch, x, y)) {
+    // A drag too quick to have reported a move on the way is still a drag.
+    return;
+}
+```
+
+`tryFlick` marks the press consumed, so the two paths cannot both type.
+
+**Rule.** A gesture defined only by intermediate events is a gesture the system is allowed to drop.
+Decide it from the start and end points, and treat the intermediate events as an optimisation that
+makes it feel immediate — not as the definition. And note the measurement that made this visible:
+two chained `input tap` calls on an emulator took **ten seconds**, so anything with a timeout
+shorter than that cannot be exercised from a shell at all. Know which of your behaviours the test
+harness is too slow to reach, and say so rather than reporting them as verified.
+
+### 15.19 One setting for two shapes of screen
+
+**What happened.** Height, the layouts on offer, the floating panel and its opacity were each one
+value. A keyboard sized to leave room on an upright phone swallows a sideways one; a floating panel
+that earns its place on a wide screen is in the way on a tall one. The user set it right, turned the
+device, and had to set it again.
+
+**The fix.** Give the settings that depend on the shape of the screen two values apiece, under keys
+with the orientation appended, and read the one for the orientation being drawn:
+
+```java
+public String key(String base) {
+    return base + "." + suffix;          // height_scale.portrait, height_scale.landscape
+}
+```
+
+Two things make the split safe. Reads fall back to the un-suffixed key the setting had before, so an
+upgrade keeps what the user chose in **both** orientations until each is set on its own; and writes
+go to the oriented key only, so the moment one side is changed it stops following the old value. And
+the settings screen names which orientation it is editing rather than following the device, because
+turning the phone to change a setting means losing sight of the setting you came for.
+
+**Rule.** Before storing a preference, ask whether it is a preference about the *keyboard* or about
+the *screen*. A per-screen one wants a value per screen, a migration path from the single value it
+used to be, and a way to set the other screen's value from this one. And rebuild on rotation: the
+input view is not guaranteed to be recreated, so `onConfigurationChanged` must do it when the
+orientation actually changed.
+
+### 15.20 A key swallowed by trying to predict the unpredictable
+
+**What happened.** Tab, Escape, the arrows and the F-keys did nothing at all. The
+key drew as pressed, the view emitted a proper `RAW_KEY`, and the executor's route
+for it was right. In between, `EditorBoundsPredictor.after` did not know `RAW_KEY`
+and threw `IllegalStateException` — and the service's "no editor may ever kill the
+keyboard" `catch (RuntimeException)` swallowed it. The guard hid the defect: a
+catch wide enough to absorb your own bugs manufactures silence.
+
+**The fix.** Teach the predictor `RAW_KEY`, not by predicting anything but by
+saying it **cannot** be predicted. Tab may indent or move focus, an arrow moves
+the cursor, Escape may do nothing. Only the editor knows where the cursor went.
+
+```java
+case PERFORM_EDITOR_ACTION:
+case RAW_ENTER:
+case RAW_KEY:
+    return EditorBounds.unknown();
+```
+
+**Rule.** When a new action kind joins the pipeline, find every `switch` that
+consumes it. A `default: throw` catches what you missed — unless something above
+swallows the throw, in which case it catches nothing. And "I don't know where the
+cursor is" is not a wrong answer; pretending to know a wrong position is worse.
+
+### 15.21 Glass has no key you can keep holding
+
+**What happened.** Tab sat beside Ctrl/Meta/Alt as a latching modifier. A press
+moved it in and out of the armed set, but nothing that reads that set has a TAB
+branch and `KeyModifier` has no TAB. Pressing it changed a colour and typed
+nothing. Tab is not a modifier — it is a key in its own right.
+
+**The fix.** There are two things a finger can do to a key: a tap **types**, and a
+hold **keeps it held**. So a tap on Tab types one (chording with whatever modifier
+is armed), a hold latches it down, and a second hold lets it up.
+
+Holding a key down means being able to send half a press. `RawKeyPhase` carries
+that half: `TAP` is down and up, `HOLD` is the down alone, `RELEASE` the up.
+
+```java
+sink.accept(ProjectKeyEvent.softwareDown(TAB_KEY_ID, SemanticInput.rawKey(
+    RawKey.TAB, EnumSet.noneOf(KeyModifier.class),
+    tabHeld ? RawKeyPhase.HOLD : RawKeyPhase.RELEASE)));
+```
+
+`keyFillColor` paints a latched key with the accent — which means **the latch must
+be in the drawing cache signature**, or the state changes and the screen does not.
+And the up must be sent when the editor session changes: a key left pressed must
+not outlive the editor it was pressed in.
+
+**Rule.** Arming a key and holding one are different things. Arming is view-local
+state waiting for a next key; holding is a fact the editor has already been told.
+If you create the second, create the way back out of it (hold again) and the way
+it cannot leak (release on session end) in the same breath.
+
+### 15.22 One key, or every key
+
+**What happened.** Shift had three states for a long time — off, armed for one letter, locked.
+Ctrl, Meta and Alt did not. They were in a set or out of it, two states, so using Ctrl more than
+once meant pressing it again for every key. The same idea had been built twice and only one of
+them had grown.
+
+**The fix.** Pull the state out into `LatchState` and let Shift and the modifiers share it. A tap
+arms for one key, a hold locks, and a tap on a locked one clears it — the way out of a lock should
+be the easiest thing to find. The difference only shows when a key is pressed: a chord carries
+**every** modifier that is active, and afterwards **only the one-shots are spent**.
+
+```java
+public boolean consumeOneShots() {   // ModifierLatches
+    boolean changed = false;
+    for (ControlKey modifier : KEYS) {
+        changed |= latch(modifier).consumeOneShot();   // a locked one is never spent
+    }
+    return changed;
+}
+```
+
+**Showing it.** A background colour alone cannot separate "one key" from "every key". So the key
+carries a mark in its top-right corner: **an open ring while it is not held, a filled disc while
+it is.** The background says the same thing in colour — soft accent for armed, solid for locked.
+One fact on two channels, so the shape is still there for anyone the colour does not reach. Tab
+and Shift draw the same mark, because they are keys that do the same thing.
+
+**Rule.** The second time you need a state machine you already have, take the first one out rather
+than writing the second. And three states need two channels to show them: two states fit in one
+colour, three do not.
+
+### 15.23 Three states will not fit in one colour
+
+**What happened.** A modifier armed for one key was painted a blue so pale it was nearly white.
+Whether it was on at all took a second look, and set beside the locked state the only thing the two
+clearly had in common was being blue.
+
+**The fix.** Give each state its own colour — a mid blue for armed, a far deeper one for locked.
+But the moment a fill goes strong, **the label sinks into it**. The light theme's locked blue is
+dark; the dark theme's is bright. Choosing the ink by theme means one of the four gets it wrong.
+
+So the ink is chosen from the fill's own luminance. 0.179 is where sRGB black and white win
+equally against a background; it is not a taste setting.
+
+```java
+public static boolean prefersDarkInk(int red, int green, int blue) {
+    return relativeLuminance(red, green, blue) > 0.179;
+}
+```
+
+`KeyLabelContrast` leans on nothing from Android — it takes three channels rather than a packed
+colour, so it is testable without a device, and which ink each of the four latch colours gets is
+pinned by tests.
+
+**Rule.** Three states cannot be said in one colour. And a change to a background colour is a
+change to a text colour: compute the contrast rather than judging it, because the eye is generous
+to the colour it just picked.
+
+### 15.24 The key it wrote was not the key it read
+
+**What happened.** The keyboard's height would not change. The size keys in the menu and the
+slider in settings both wrote a new value, and the keyboard stayed exactly as it was. When the
+settings were split per orientation the write moved to `height_scale.portrait`, but the read that
+runs when a preference changes still asked for the old `height_scale`. That key does not exist, so
+it got **the default back** — and put the height back to default the instant the user changed it.
+
+```java
+// wrong: nothing writes this key any more
+prefs().getFloat(KEY_HEIGHT_SCALE, DEFAULT_SCALE)
+// right: the key this orientation actually writes
+OrientedPrefs.getFloat(prefs(), KEY_HEIGHT_SCALE, orientation(), defaultHeightScale())
+```
+
+Splitting a setting in two is one change at the write and several at the reads, because the reads
+are scattered. Here there were two — the constructor and the preference-change callback — and only
+one of them was moved.
+
+**The default moved with it.** A height computed from density alone means something different on
+every screen. It is now a quarter of the display's **long** edge, in both orientations, so the
+keyboard is about the same size in the hand whichever way the phone is held; a quarter of the
+short edge would make the landscape keyboard a strip.
+
+**Rule.** When one setting becomes two keys, find every place that reads it. And if the default
+depends on the screen, compute it in one place — a keyboard and a settings screen that believe
+different defaults put the slider on a number the user is not looking at.
+
+### 15.25 Fingers lift in an order the automaton never saw
+
+**What happened.** 획추가 sometimes did nothing during fast typing: a consonant landed plain and
+the stroke was lost. Keys type on **release**, so that a fingertip can slide to its neighbour
+before committing — but in a fast roll the next finger is down before the last one is up, and the
+two can lift in either order. When the 획추가 finger lifted first, the interpreter saw
+stroke-then-consonant: the stroke found nothing to act on and answered nothing, and the consonant
+then typed as itself. Every table and every composer test was correct; the defect was in the
+order the touch layer fed them, which no unit test of the automata could ever reach.
+
+```java
+// beginTouch: a second finger coming down settles every letter still riding on an earlier one.
+settlePendingTaps();   // types them in press order, and spends their release
+```
+
+A finger that has already acted — a hold, a repeat, an open flick guide — is left alone, and so
+is a finger on a control key: a modifier chord *is* two fingers down at once, and settling it
+would tap the modifier out from under the chord. The settled press sets `holdConsumed`, the same
+flag every consumed gesture uses, so its release walks into the existing early-return and types
+nothing more.
+
+**Why press order needs its own counter.** The touch map is keyed by pointer id, and pointer ids
+are recycled: with two fingers down the next press can get an id *below* the one still held.
+Settling by map order would replay the roll bug it exists to fix, so each touch carries a serial
+from a monotonic counter, and settling sorts by that.
+
+**Rule.** A stateful automaton behind a release-typed keyboard must be fed in press order, and
+the only moment press order is still known is the next finger's down. Commit pending taps there.
+And test the *feed* — the interpreters and the composer were blameless for as long as this went
+unnoticed, because every test handed them keys in the order the user pressed them.
+
+### 15.26 An automaton whose memory is the only copy
+
+**What happened.** 획추가 and 쌍자음 still sometimes did nothing: the 나랏글 interpreter acts on
+the letter it *remembers* typing, and that memory is cleared by things the user does not connect
+to typing at all — an editor restarting its input session, a hardware key, a layer switch. The
+letter is still right there on screen; the key that transforms it has simply forgotten it.
+
+**The fix is a fallback, not more memory.** When the interpreter answers a transform key with
+nothing, the press is sent on as a `TRANSFORM` semantic input, and the processor resolves it
+against what is actually on screen, in two tiers:
+
+```java
+// Tier 1: something is composing — its trailing jamo is the target.
+int consonant = composer.trailingConsonant();   // bare choseong, or the batchim's tail
+// Tier 2: nothing composing — read the character before the cursor, transform its
+// last jamo, and re-open the result as a composing syllable so typing continues.
+```
+
+Tier two re-creates the live behavior exactly: a batchim transforms in place (각 → 갘), a double
+that cannot be a batchim splits the syllable (갇 → 가ㄸ), a compound final unwinds its tail
+(많 → 만ㅇ), an open syllable iotates its vowel (가 → 갸) — and the result is *composing* again,
+seeded into the composer, so the next vowel still moves the batchim on (갘 + ㅏ → 가카). Editors
+that cannot answer `getTextBeforeCursor` (terminals) simply make the press a no-op, which is what
+it always was.
+
+**Rule.** When an automaton's only state is its memory of what it just wrote, every reset of that
+memory becomes a dead key. Give every transformation a way to re-derive its target from the
+document itself; the memory then becomes an optimization, not a requirement.
+
+### 15.27 A composition that follows the cursor
+
+**What happened.** While a syllable was composing, tapping or clicking the cursor to another spot
+sometimes made that half-typed syllable appear at the new position. The composer does not watch
+the cursor; it kept its state across the move, and the next key's `setComposingText` painted the
+whole stale syllable wherever the cursor now was.
+
+**The trap this fix had to avoid.** The obvious rule — "selection changed in a way we did not
+predict, so reset" — was tried once (v0.1.11) and killed the keyboard: real editors do not land
+exactly on predicted positions, so our own keystrokes read as external movement and every key
+reset the composer. The fix was reverted within a day (v0.1.12).
+
+**The signal that cannot mis-fire.** `onUpdateSelection` also reports the editor's own composing
+region (`candidatesStart..End`). While the keyboard is composing, its own edits always leave the
+cursor at the end of that span — so a new selection lying outside the span is something only the
+user can produce:
+
+```java
+CursorMovePolicy.shouldAbandonComposition(composing, newSelStart, newSelEnd,
+    candidatesStart, candidatesEnd)
+// true → finishComposingText() (the syllable settles where it was), reset the
+// composer, end the 12-key run. The next key types clean at the new position.
+```
+
+Reports without a span are left alone — a commit's intermediate state looks like that, and so
+does every report from an editor that never marks its composing text; resetting on those would
+break composition one keystroke at a time. Those editors keep the old (rare) behavior rather than
+getting a new bug.
+
+**The editors that report no span at all.** Compose text fields — Google Keep among them — pass
+`candidatesStart = -1` even mid-composition, so the span test never fires there and the stale
+composition survived: typing after a tap dragged the cursor straight back to the old spot. For
+exactly those reports there is a second verdict, still prediction-free: while the keyboard is
+composing, its own (batched) edits always leave the cursor immediately after the preedit, so
+`getTextBeforeCursor(preedit.length())` must read back as the preedit. Anything else there — or a
+range selection, which composing never produces — is the user's hand. A null read leaves the
+composition alone, exactly like a missing span.
+
+**Rule.** Judge "did the user move the cursor?" only by evidence the editor asserts — its own
+composing span, or failing that its own text — never by comparing against positions you
+predicted. And when a composition is abandoned, settle it in place first; text must never travel
+with the cursor.
+
+**The span test was still too weak.** "Outside the span" let a cursor sitting on the span's own
+start pass as ours, which for a one-syllable preedit is the position just before it — see 15.28.
+
+### 15.28 "Inside the preedit" is not a place you can tap
+
+**What happened.** Type 바다가자, move the cursor to just before the last syllable, press
+Backspace: the keyboard deleted from the end — 바다가ㅈ — instead of at the cursor. Only from that
+one spot. Move the cursor anywhere else first and Backspace behaved. (Reported as issue #5, and
+noticed a release earlier in issue #2.)
+
+**Why that one spot.** 15.27's rule asks whether the new selection lies *outside* the editor's
+composing span, and 자 was still composing at `3..4`. Tapping immediately before it puts the
+cursor at 3 — the span's own start — which is not outside it. So the composition was kept, and
+`HangulInputProcessor.delete()` handed Backspace to the composer, which decomposed 자 and wrote
+the result back over the span. The cursor was never consulted; `setComposingText` always replaces
+the composing region, wherever the cursor happens to be.
+
+The rule was written thinking of a preedit you could tap into the middle of. **A Hangul preedit is
+one syllable.** It has no middle: every position in it is either its end — where our own edits put
+the cursor — or its start, which is a place the user can only reach by moving the cursor there.
+
+**The fix.** Ask the exact question instead of the weaker one. Composing leaves the cursor
+collapsed at the span's end and never selects a range, so that is the only report our own edits
+produce:
+
+```java
+// before: outside the span?
+return newSelStart < candidatesStart || newSelStart > candidatesEnd
+    || newSelEnd < candidatesStart || newSelEnd > candidatesEnd;
+// after: exactly where our own edit would have left it?
+return newSelStart != newSelEnd || newSelStart != candidatesEnd;
+```
+
+This closes the same hole for longer preedits — Telex, romaji — where a tap can genuinely land in
+the middle.
+
+**Rule.** When you write a containment test, name the positions your own code actually produces
+and compare against those, not against a region you imagine the user moving in and out of. 15.27
+is this defect's mirror: that one abandoned a composition too eagerly and had to be reverted in a
+day; this one held on too long and took months to surface, because holding on looks like nothing
+at all until a cursor lands on the one boundary that reads as "still ours".
+
+### 15.29 A latch with two owners
+
+**What happened.** The action bar's Ctrl/Alt/Meta slots lock on a hold, the way the pad's modifier
+keys do. Press one again to let it up and the modifier did come off — but the slot stayed painted
+locked, and it could never be locked again.
+
+**Why.** Two objects were keeping the same fact. `ModifierLatches` in the keyboard view holds the
+real state; `ActionBarView` keeps a `latched` set of its own, because it has to paint the slot and
+decide whether the next hold should latch. A press on a locked built-in went through
+`listener.onAction(...)`, which taps the keyboard's latch — correct, the modifier came off — while
+nothing told the bar, whose set still held the slot. From then on `paint()` drew the accent
+unconditionally and `press()` refused to schedule a new latch, because both ask
+`latched.contains(slot)`.
+
+**The fix.** The press that lets a locked slot up goes through `setLatched(false)`, which is the
+one path that changes both: it updates the bar's set and calls `onChordLatch(slot, false)`, which
+unlocks the keyboard's latch. `onAction` is left for the slots that are not currently down.
+
+**Rule.** When a second object must cache a fact it does not own, give it exactly one path in and
+one path out, and route every press through them. A latch that can be cleared by two routes will
+be cleared by the one that only tells half the program — and a stuck modifier looks, to the user,
+exactly like a key held down that they cannot let up.
+
+### 15.30 A terminal is a fourth kind of editor
+
+**What happened.** Typing into Termux was broken in both of the modes it offers, and each looked
+like a different bug. With `enforce-char-based-input = true` a Korean syllable appeared only once
+it closed, and Backspace did nothing at all. With it off, Backspace worked and Korean did nothing
+whatever. (Issue #7.)
+
+**One shape, two disguises.** Termux reports `TYPE_NULL` in the first mode and an ordinary
+`TYPE_TEXT_VARIATION_VISIBLE_PASSWORD` field with no suggestions in the second. Neither describes
+what is actually there: a program on the other side of a pipe. There is no text view, so there is
+**no composing region** — whatever the IME marks as composing is invisible until it is committed —
+and **no buffer**, so a surrounding-text delete lands on the connection's own dummy `Editable` and
+stops there. This keyboard knew three kinds of editor: rich text, TYPE_NULL as "send keys", and
+the remote-desktop shape. A terminal is a fourth, and each of the three failed it differently.
+
+**Three separate refusals, one per symptom.**
+
+1. *Composition never reached the screen.* Composition is already rewritten into commits for
+   editors with no composing region — the remote-desktop path — but that was switched on only for
+   four package names. `TYPE_NULL` did not turn it on, so every `setComposingText` was refused as
+   an unsupported operation and only the closing commit got through. **Hence "syllables appear
+   only when finished".**
+2. *Deletes were refused, then unreachable.* A materialised syllable is rewritten by taking back
+   what was put on screen and committing what replaces it — two actions in one plan. A raw-key
+   editor accepted only *single* actions of a short list that did not include the take-back, so
+   the whole plan was refused; and the take-back, when it was allowed, used
+   `deleteSurroundingTextInCodePoints`, which a terminal never sees. **Hence "backspace does
+   nothing".**
+3. *A visible-password field was never composed into.* Composing was refused outright wherever the
+   field was marked private. A terminal reports that variation to turn suggestions off, and so
+   does every login form with "show password" ticked. **Hence "Korean does nothing" — and Korean
+   could not be typed into any password field in any app.**
+
+**The fix.** A terminal is named in the model: `EditorCapabilities.asTerminal()` — no composing
+region, no buffer, deletion by key event. `TYPE_NULL` means it by definition; terminals that report
+a text field are recognised by package, because nothing in the `EditorInfo` distinguishes them from
+a login form. A plan of commits and deletes is accepted whole. And being private went back to
+meaning what it should: never read this field, never remember what was typed in it — composing was
+never the leak.
+
+**And the name list was not enough either.** The first cut recognised a text-reporting terminal by
+package name, which passes its own unit tests and fails on the first terminal nobody listed. What
+every terminal has in common is not its name: it is that it does not know where its cursor is —
+there is no buffer for one to be in — while a text field always does. `initialSelStart` at -1
+together with the visible-password-no-suggestions shape names the *kind* instead of the *app*.
+This was found by putting a terminal-shaped editor on the far side of the real framework and
+typing into it (the instrumentation build's `TerminalHostActivity`): the unit tests were green and
+the device was not.
+
+**What real Termux reports.** Measured on 0.118.3, Android 13: the terminal view reports
+`inputType=0x0` (TYPE_NULL) and `initialSelStart=-1`, **and it keeps reporting TYPE_NULL with
+`enforce-char-based-input=false` written into `~/.termux/termux.properties` and the app
+restarted.** So the two modes a user sees are not always two `EditorInfo` shapes; a build that
+reports the visible-password shape exists — that is the other half of the report — but this one
+does not, which is why the shape rule matters and why a name list would have been enough here and
+useless elsewhere.
+
+**Physical keyboards, the half left open.** A terminal used to get every physical key passed
+straight through — `onKeyDown` returned early for a RAW_KEY editor, and `applyHardwareMode` gave
+it no mapper — so that Ctrl-C and the arrows reach the program. That also kept Korean from a
+Bluetooth or USB keyboard out of the composer. Now a terminal gets the same mapper as any editor
+(`TerminalHardwareKeys`): a key the current layout maps — a Korean or a Colemak letter — is typed
+through the composer and materialised like a soft key, and every key no mapper claims (Ctrl
+chords, arrows, Enter, Esc, Tab, Space in Korean mode) still passes through untouched. English on a
+QWERTY keyboard maps nothing and keeps the plain passthrough. One trap came with it: a passed-through
+key must **end the syllable first** (`endSyllableBeforeDelegating`). The syllable is already on the
+far side, so ending it writes nothing — but without it, 가 + Space + ㄴ redraws 가 as 간 by taking
+back one character, and the character it takes back is the Space. This also holds for
+remote-desktop windows, which materialise composition the same way. `TerminalHardwareKeyTest`
+records the hazard and the fix.
+
+**The take-back rode the wrong channel (0.1.165).** The 0.1.162 device check typed two syllables
+into real Termux and passed. An eight-syllable word — 한글입력대한민국 — came out garbled 0 times in
+11 intact, from soft keys and physical keys alike. A redraw is a take-back and a commit in one
+plan, and the take-back went out as a backspace **key event**: that travels the view's input-event
+queue, while `commitText` is written to the terminal at once (Termux's `sendTextToTerminal`), so
+the commit overtook the key and the late backspace erased it. The take-back is now the terminal's
+own erase character — DEL, `0x7f`, the exact byte Termux's Backspace key sends — committed as text
+on the same channel as the syllable after it (`executeTerminalErase`): 11 of 11 intact. A lone
+Backspace the user presses stays a key event; nothing follows it in its plan, and a real key lets
+the terminal pick its own erase byte. `deleteSurroundingText` is no way out: Termux turns it into
+the same key events. The old path also passed the take-back's count where the prior-operation count
+belonged, so it always sent one backspace — harmless for a one-code-point syllable, wrong for a
+Telex word. **Rule:** test a terminal with a long word; two channels that race lose only under load.
+
+**A terminal app is not only its terminal (0.1.166).** Termux's toolbar carries a plain `EditText`,
+and `com.termux` is on the name list, so every field in the app was classified as a terminal. While
+the take-back was a key event that field absorbed it and nobody noticed; once it became DEL as text,
+the field kept the character and 바다가 stood there as ㅂ␡바␡받␡바다… (reported against 0.1.165, on
+both of the reporter's phones). The name list is now held to the same signal as the shape rule: a
+listed package counts as a terminal only where the editor reports **no cursor**. A field that says
+where its cursor is has a buffer, whatever app it belongs to. **Rule:** a per-app rule must still
+ask what the *editor* is; an app that is one thing usually also contains the other.
+
+**A syllable cannot wait forever there (0.1.167).** In a remote-desktop window the owner moved the
+pointer away mid-syllable and typed on: the syllable was re-inserted at the new place, one
+character of what stood there eaten to make room. Same shape as llsant's Termux-arrow report. The
+cause is structural, not a slip: a materialised syllable is held open so it can be redrawn, and the
+cursor moved where no report reaches this keyboard — a terminal reports no cursor at all, and a
+remote client's dummy buffer reports only echoes of our own commits, which is why the cursor-move
+verdict is off for these editors (64f1b60; turning it back on made 일 arrive as 이ㄹ). With no
+signal, the remaining handle is time: `IdleSyllableSettle`, 1500 ms with no input, drops the claim.
+Nothing is written — the characters are already on the far side — so the text does not move; only
+the right to take them back ends. The cost is that a syllable cannot be resumed across a pause in a
+terminal or a remote desktop. Ordinary editors are untouched: they have a composing region and
+report cursor moves, so they never needed a clock.
+
+**And then the clock turned out to be unnecessary for remote desktop (0.1.168).** The reason the
+cursor-move verdict was off there was an assumption, never a measurement: that a remote client's
+dummy buffer reports noise. Measured against the Microsoft client (Windows App 11.0.26071.13915)
+driving a real Windows 11 VM from the emulator, it reports plainly. While typing, each commit
+steps its selection forward by one — 1, 2, 3, 4 — and nothing moves on its own, not in twelve
+seconds of sitting still. A click on the remote screen sends it back to 0, which no key of ours
+did. What made the old attempt misfire (일 arriving as 이ㄹ) was comparing a report against the
+*present* cursor: two keys can be typed before the first report lands, so an echo looks like a
+jump. `MaterializedCursorMoves` compares against a queue of *expectations* instead — where each
+dispatched write should have left the cursor — and a report matching any of them is an echo,
+however late. A report matching none is the user. Verified on that VM: composing 바, clicking
+elsewhere and typing ㅌ leaves 바 where it stands and starts ㅌ fresh; without the click the same
+two keys still compose 밭. Terminals have no such signal — they report no cursor at all — so there
+the 1.5 s clock remains the only handle.
+
+**Then the take-back itself went, for terminals (0.1.169).** Every terminal defect above — the
+key overtaken by the commit, DEL landing in a text field, the flicker the reporter saw, an arrow
+button dragging a syllable — is a cost of one choice: drawing the syllable into a place that
+cannot hold a composing region, and taking it back with each jamo. A terminal can instead be left
+out of composition altogether. `EditorCapabilities.composingOffScreen()` marks the editor;
+`HangulInputProcessor` then drops `SET_COMPOSING_TEXT` and `FINISH_COMPOSING` from every plan
+(a raw-key editor refuses both, and a refused call takes the whole plan with it) and sends only
+what closes. The half-built syllable is shown on `ComposingStripView`, the IME's *candidates
+view* — chosen over a floating panel because Android puts the candidates view on screen even
+while the keyboard itself is hidden, which is exactly the plugged-in-keyboard case. Nothing is
+ever taken back, so there is nothing for a hidden cursor move to misplace, and the 1.5 s clock no
+longer arms there: 바, a pause, ㄷ composes 받 again. What changes meaning is every path that
+used to assume the syllable was already on the far side. Ending a syllable — before a passed-through
+physical key, on leaving the field, switching language or turning Korean off — now *writes* it
+(`commitSyllableHeldOnTheStrip`), or it would be dropped. The floating keyboard's touchable region
+is now offset by the panel's position in the window, since a strip above the input view pushes it
+down. The old drawing is kept behind a setting (**Terminals** on the general page) because
+seeing the syllable inside the terminal was what the reporter valued. Measured in Termux 0.118.3
+on the emulator: eight-syllable words 11/11 intact at 120 and 300 ms per key; ㄱㅏㄴ + Backspace
+gives 가 with no DEL byte written; physical 가 Space 나 gives `가 나`; leaving for the home screen
+mid-syllable kept it 7 times in 8 — the one loss, on the first try, did not recur, and a
+connection the app has already closed would lose it the same way. What the emulator cannot show:
+the strip itself (an IME window has no drawing surface there) and the floating keyboard's touches
+with the strip up.
+
+**And the strip could not be seen (0.1.170).** The reporter tried 0.1.169 on both phones, docked and floating: only finished syllables arrived, and no strip appeared anywhere. The emulator had passed because its first measurement happened to create the window with the strip already showing. Dumping the IME window's view tree with the keys up showed the cause: `ComposingStripView` and its candidates frame were `VISIBLE` with the text in them, but their parent — the framework's full-screen area — was `INVISIBLE`. `InputMethodService.updateExtractFrameVisibility()` sets that area to the candidates' visibility *at the moment the window is laid out*, and `setCandidatesViewShown(true)` later changes only the candidates frame inside it. The fix walks up from the strip and makes each hidden parent visible when the strip is shown. The same dump showed a second cost: the default hidden visibility is `INVISIBLE`, which keeps its room, so from 0.1.169 every app had an empty 56 px band above the keys; `getCandidatesHiddenVisibility()` now returns `GONE`. Floating mode needed a different answer altogether. Its window covers the screen, so the candidates strip landed at the top of the display under the status bar, and each time it came or went the panel below lost or regained 56 px and the keys changed size. There the syllable is drawn in the floating panel's own title bar, between the cross-over and close keys (`FloatingKeyboardFrame.setComposingText`); the candidates strip stays for docked keys and for a hardware keyboard with the keys hidden. Checked by rendering the IME window's decor view into a bitmap on the emulator, docked and floating.
+
+**Rule.** When two symptoms in one app look like two bugs, ask what the app *is* first. When a
+capability is switched on by a list of package names, ask what the list is standing in for — here
+it was standing in for "has no composing region", which two other kinds of editor also are. And
+when a fix depends on recognising something, test it against something it does not recognise.
+
+### 15.31 A panel of the keyboard's own that lets keys fall through
+
+**What happened.** The notepad is a panel the keyboard draws over the app, with its own text fields.
+While a note was open, the service routed letters, jamo, Backspace and Enter into it — and nothing
+else. Ctrl chords from the soft Ctrl, the action bar's arrows and Home/End, a held Tab, and the
+bar's select-all, word, cut, copy and paste all went past the note to the app behind it: Ctrl+C
+copied from a field the user could not see, and the bar's arrows moved a cursor nobody was looking
+at (0.1.172).
+
+**The fix.** Every input kind is the panel's while it is open. `NotepadKeys` reads a raw key plus
+modifiers into a command (Ctrl+A/C/X/V/Z/Y, Shift+Insert, arrows, Ctrl+arrow word jumps, Home/End,
+page keys, Tab, Delete), `NotepadView.applyKey` carries it out on the focused field — Shift extends
+the selection — and the context-menu commands from the bar go to `NotepadView.editCommand`. A key
+the panel has no use for is swallowed, not forwarded; a hold acts once and its release does nothing.
+
+**Rule.** A panel that takes the keyboard's text must take all of it. List the input kinds the
+dispatcher can produce and decide for each one what the panel does with it; "everything else goes to
+the app" is how a panel leaks.
+
+### 15.32 Modifiers read from one place, and spent by the first repeat
+
+**What happened.** The action bar's arrows chorded with the keyboard's own latches but not with a
+Ctrl held on a physical keyboard; its text slots chorded with nothing at all, so a slot of `c` under
+Ctrl typed `c`; and the arrows did not repeat while held. When repeat was added, a one-shot Ctrl
+armed before the press chorded the first step and was then spent, so the rest of the hold moved
+character by character (0.1.174). The keypad pages had the opposite gap: no Shift at all, so an
+arrow could not select from them (0.1.173).
+
+**The fix.** Three sources, one union: the bar's modifier slots, the keyboard's latches, and the
+physical keyboard's held keys (`HeldHardwareModifiers`, §9). The bar reports when a finger comes
+down and lifts (`onPress`); the service reads the union then, spends the one-shot latches once, and
+uses that set for every event of the press. A text slot of one letter or digit is a key: under
+Ctrl/Alt/Meta it is sent as the chord, and Shift alone capitalises it (`BarKeyChord`). The keypad
+and cursor pads got a Shift in their empty cell, behaving like the letter pages' own.
+
+**Rule.** A key is a key wherever it is drawn. Whatever modifiers can be down, from whatever source,
+apply to it; and state that belongs to a press is read when the press starts, not on every event the
+press produces.
+
+### 15.33 A history that shadows the clipboard
+
+**What happened.** The keyboard's clip list recorded a clip only after its own Copy or Cut. A phrase
+copied in a browser never appeared in it, and a clip picked from it was typed but never became the
+clipboard, so the app's own Paste disagreed with the list — two clipboards that looked like one
+(owner's report). Fixing that exposed a second defect: the list was read from storage only when the
+panel opened, so the first clip recorded after the keyboard started was added to an empty list and
+saved over the whole history (0.1.174).
+
+**The fix.** Register an `OnPrimaryClipChangedListener` in `onCreate` and record every change; read
+the current clip when the list opens; put a picked clip on the clipboard before typing it. Skip a
+clip the copying app marks sensitive (`ClipDescription` extras, Android 13) as well as anything
+copied from a sensitive field. Load the stored list before the first record, whichever path records
+it.
+
+**Rule.** A convenience copy of system state must follow the system, in both directions. And a cache
+that is lazily loaded must be loaded before its first write, not only before its first read.
+
+### 15.34 A key that arrives while a syllable is still being built
+
+**What happened.** A key event pressed while a syllable was still composing — the action bar's
+arrow, a soft Ctrl chord, a pad's Tab or Esc, a raw Enter — was planned as two actions: commit the
+syllable, then send the key. The executor's batched path could commit but could not send a key
+event, and threw; the service caught the exception, reset the composer and showed a failure. The
+syllable had already landed, so what the user saw was the key doing nothing: 가 and then Enter in
+Termux wrote 가 and ran no command. It hit rich-text fields and the terminal strip alike, and only
+the remote-desktop and drawn-terminal paths escaped, because there the syllable was already on
+screen and the plan was the key alone. The first run of the interaction matrix found it; real Termux
+confirmed it (0.1.175).
+
+**The fix.** `CheckedEditorExecutor` recognises a plan of writes followed by one key event, runs the
+writes as a plan of their own, and then sends the key through the single-key path — the same split
+it already made for a trailing editor action.
+
+**Rule.** An exception caught to keep the keyboard alive is also a defect hidden from everyone.
+Wherever a composer can put two kinds of action in one plan, test that plan end to end; and treat a
+caught exception on the typing path as a failure a test must be able to see.
+
+### 15.35 A near miss that changes the page
+
+**What happened.** Measured on the emulator by tapping 천지인 and 나랏글 sentences at jittered
+points (σ a quarter of a key), whole sentences went wrong from one tap on. The utility column sits
+directly beside the first Hangul column: a tap aimed at ㅣ landed on **123**, one aimed at ㄹ landed
+on **Move**, and every key after it typed digits or moved the cursor. A tap aimed at the space bar
+landed on ⌫ above it and erased a character. Separately, a tap whose fingertip slid 14–20 dp —
+ordinary when typing fast — came out as a flicked letter on 천지인, because a drag of 14 dp already
+counted as a flick (0.1.176).
+
+**The fix.** `TouchTargets` resolves every touch. A costly key — one that changes the page or
+overlay (123, Move, 漢, the layer and layout keys) or erases (⌫) — gives the strip of its cell
+nearest an ordinary key, `YIELD` = 35 % of its width or height, to that key; a finger has to mean it
+to reach the costly key, and every pixel still belongs to some key. The flick distance went from 14
+dp to 18 dp; deliberate drags of 22 and 30 dp still flick. Same seeds, before and after: 25 % jitter
+16 → 8 wrong characters on 천지인 and 14 → 8 on 나랏글, with no sentence lost after a stray tap;
+slides up to 20 dp 21 → 6 on 천지인.
+
+**Rule.** Weigh a miss by what it costs, not by where the line was drawn. A key whose accidental
+press damages more than one character should be harder to hit by accident than the keys around it.
+
+### 15.36 A panel that outlives the keyboard
+
+**What happened.** The notepad and the clipboard list stayed open when the keyboard was dismissed,
+and came back in its place the next time a field asked for the keyboard. In Termux that became a
+loop (issue #8): the notepad makes the IME window take the screen, Termux answers by asking for the
+keyboard to be hidden (the input-method history shows `HIDE_SOFT_INPUT` from `TermuxActivity`), and
+the next keystroke brought the notepad back to be hidden again.
+
+**The fix.** `onFinishInputView` and `onWindowHidden` close both panels, saving the note as usual.
+In Termux, Memo now simply closes with the keyboard; making the notepad usable there would need it
+to cover the terminal without resizing it.
+
+**Rule.** A panel that replaces the keyboard lives exactly as long as the keyboard is on screen.
+
+### 15.37 A modifier that waits for the finger to leave
+
+**What happened.** Shift, and the Ctrl/Alt/Meta latches, took effect when the finger lifted. Typing
+fast rolls one key into the next: Shift goes down, the letter goes down, the letter lifts first. The
+letter was therefore typed unshifted, and the modifier — arming itself as it lifted — landed on the
+key after it. 빠가다 came out as ㅂ까다: one motion, two wrong letters. With timings dispatched
+exactly (emulator, 2026-09-16), every order except "Shift lifts first" was wrong, including holding
+Shift down and tapping the letter, which is how a keyboard is meant to work.
+
+**The fix.** A modifier key arms on **press**. While its finger is still down, nothing spends the
+one-shot, so every key typed under it is modified; when the finger lifts, the keyboard spends the
+one-shot if anything was typed while it was held, and leaves it armed if nothing was. Holding still
+locks it, as before.
+
+**Rule.** A key that changes what another key means has to take effect when it is pressed. Anything
+else breaks the moment two fingers overlap, which is what fast typing is.
+
+### 15.38 Where the typos actually were
+
+**What happened.** Two measurements, taps placed by a jittered generator and scored against what the
+keyboard typed (emulator, 2026-09-16):
+
+- **The action bar was taking its height out of the keys.** Docked, the bar and the keys divided one
+  height, so switching the bar on made every row 30 % shorter. At the same finger scatter the miss
+  rate went from 0.7 % to 3.7 % (σ 5 dp) and 3.0 % to 7.3 % (σ 7 dp). v0.1.177 added the bar **above**
+  the keys instead; in v0.1.179 the user asked for it back **inside** the height, which is where it
+  had been before, and where it stays: whether the bar counts towards the height is not worth a rule
+  of its own, and anyone whose rows feel short raises the height setting. The measurement is still
+  true — it is the reason the remedy is named here rather than left to be rediscovered.
+- **The platform's long press was typing alternates.** At the system's 400 ms, presses held 380–450
+  ms — ordinary in unhurried typing — produced the key's alternate instead of its letter 23 % of the
+  time. A key that types an alternate now waits `ALTERNATE_HOLD_MS` (520 ms, or the system's timeout
+  if that is longer); Shift and the modifiers keep the system's timing, because a hold there types
+  nothing.
+
+**And where a miss is cheapest to correct**: a touch that lands within `JAMO_BAND` of the line
+between a consonant key and a vowel key is settled by what the syllable can take next — nothing
+composing means a consonant, a lone consonant means a vowel, and a syllable with its vowel means
+nothing is assumed (`JamoExpectation`). Modifier keys give a fifth of the strip along their edge to
+the letter beside them, the way page-changing keys give a third (§15.35). Sentences typed at 90 ms a
+key went from two wrong characters in 77 to none; the ones left at 70 ms with a quarter-key scatter
+are consonant-for-consonant and vowel-for-vowel, which spelling cannot separate.
+
+**Rule.** Measure where the errors are before choosing what to fix, and measure again after: three
+of these four changes were worth more than anything that had been guessed at.
+
+### 15.39 A selection an editor never made
+
+**What happened.** Shift+arrow from the action bar or the keyboard moved the cursor in an ordinary
+text field instead of selecting. A `TextView` decides whether an arrow extends the selection from
+the **Shift key's own press** (`MetaKeyKeyListener` state on the buffer), not from the meta state
+carried on the arrow event, and the keyboard framed modifier presses only for editors that delete by
+key events.
+
+**The fix.** Shift's press is framed for every editor; the other modifiers still go by meta state
+alone, where a field turns them into its own shortcuts.
+
+**Rule.** Sending the right meta state is not the same as pressing the key. Where a platform reads
+modifier *state*, send the modifier as a key.
+
+### 15.40 One table, two keyboards
+
+**What happened.** The phonetic page (issue #11) was written twice: once as the rows drawn on the
+glass, once as the physical-keyboard table mapping US key positions to the same symbols. The second
+copy had a key id spelled `hardware.q` instead of `hardware.key.q` through a whole page, and nothing
+said so — a hardware table that maps nothing simply types nothing.
+
+**The fix.** One table (`IpaKeys`) holds the symbol, its held alternates and the US position of
+every key; `KeyboardLayouts` draws from it and `HardwareLayoutTables` derives its mapping from it,
+so the two cannot disagree. A test walks the positions and asserts the glass and the wire agree.
+
+**Rule.** When the same arrangement is needed in two places, write it once and derive the second.
+Duplicated tables do not fail loudly; they fail silently, in the copy nobody looks at.
+
+### 15.41 A panel that ate what it was asked to send
+
+**What happened.** The notepad's new **Send** link hands the note to the service to type into the
+app. Dispatching it straight away typed it back into the note: while the notepad is up, the service
+routes every key into it (`consumeForNotepad`).
+
+**The fix.** The host closes the panel first, then dispatches; the text goes out as typed input
+(`SemanticInput.text`) rather than a paste, so a terminal or a remote desktop takes it the way it
+takes any key.
+
+**Rule.** A panel that intercepts input intercepts what you send through it too. Take it down before
+you speak past it.
+
+### 15.42 A clipboard that only speaks when it is looked at
+
+**What happened.** Text copied in another app was often missing from the keyboard's clip list — the
+list and Android's clipboard felt like two different things (owner's report, twice). The keyboard
+was watching with `addPrimaryClipChangedListener`, registered once in `onCreate`, and that is all it
+had. Android only lets an app read the clipboard while it has focus or is the current keyboard, and
+several ROMs go further: they stop delivering the change to a keyboard that is not on screen. A copy
+made in a browser therefore reached nobody, and by the time the keyboard came up the moment had
+passed.
+
+**The fix.** The keyboard reads the clipboard itself every time it is shown — `onStartInputView` and
+`onWindowShown` both call `catchUpWithTheSystemClipboard()`, which re-registers the watch (cheap; a
+duplicate registration of the same callback is one registration) and then reads. Being shown is
+exactly the moment the keyboard is allowed to look, and exactly the moment after someone copied
+something elsewhere and came here to use it. A clip the user took off the list is remembered in
+`forgottenClip` so that reading does not walk it straight back in while it is still the clipboard.
+
+**How it was proved.** The emulator's AOSP image delivers the change faithfully, so the cell that
+was supposed to cover this passed either way — and the older cell "an outside copy" was setting the
+clipboard from the keyboard's own process, which is not outside at all. Two pieces of tooling made
+it real: a separate package (`testhost/ClipSetterActivity`) that copies the way a browser does, and
+a probe that unhooks the listener the way a ROM does (`CLIPWATCH:off`). With the watch off, the old
+build kept showing the older clip and the new one had the foreign copy the moment the keyboard
+returned.
+
+**Rule.** A permission you only have sometimes is a permission to *use when you have it*. Do not
+build on a callback that the platform may decline to deliver; read at the moments you are allowed to
+read.
+
+### 15.43 The key below kept winning
+
+**What happened.** Typing fast on the 12-key pads, ⌫ typed a space and the space bar sent Enter
+(owner's report, 2026-09-16). Two separate causes met in the same column. First, ⌫ is a costly key
+and gave the bottom 35 % of its cell to the key below (§15.38) — which on those pages is the space
+bar, not a letter, so the protection meant backspace could not be hit at all in a hurry. Second, a
+press became the neighbour's as soon as the finger left the cell by the system's **touch slop**,
+and a fast tap rolls that far as it lands and lifts.
+
+**The fix.** A costly key yields its edge to a *letter*, never to the space bar or Enter. The
+retarget margin is its own number now — `RETARGET_DP`, 16 dp past the edge — because the distance
+at which a press stops being a tap is not the distance at which it changes keys. And Enter, where a
+miss costs most (it sends the message or runs the command), gives the top fifth of its cell back to
+the space bar above it.
+
+**How it was proved.** A probe that taps and rolls (`TAPDRIFT`) measured the two cases the report
+described: before the fix, a ⌫ pressed low or rolled 10 dp typed a space and erased nothing; after
+it, both erase. Cells hold all three now.
+
+**Rule.** Protection that shrinks a key is protection against pressing it. Ask which key the user
+was aiming at, not only which one is expensive.
+
+### 15.44 A paste a shell reads as a keystroke
+
+**What happened.** Paste did nothing in Termux and Termius. On an editor that takes keys rather
+than text the keyboard sent **Ctrl+V**, which is right for a remote desktop — the far-side system
+pastes — but a shell reads Ctrl+V as *quoted-insert*: it waits and puts the next character in
+literally.
+
+**The fix.** In a terminal the keyboard reads Android's clipboard and **types it**, the road the
+clip list already used. Remote desktops keep the chord. The two are told apart by capability rather
+than by name: a terminal sends keys *and* has no surrounding text (`EditorCapabilities.isTerminal`),
+a remote desktop sends keys but keeps a dummy buffer.
+
+**Rule.** A chord means what the far side thinks it means. Where you cannot know that, send the
+thing itself.
+
+**And the pair it belongs to.** The user drew the line after seeing this fix: *the bar's editing
+keys are actions; the keyboard's Ctrl is a key.* So the bar's Paste puts the clipboard in (by
+`performContextMenuAction` where there is an editor, by typing where there is only a wire), and its
+Copy, Cut and Select all say a terminal has no selection rather than going out as Ctrl+C — which
+would interrupt the running command, not copy anything (measured: before this, the bar's Copy
+killed a `sleep` in Termux). Soft Ctrl with a letter keeps going out as the chord it looks like.
+Remote desktops are the exception on both counts: nothing is behind their connection to act on, so
+the bar uses chords there too.
+
+**The one place the name is asked after all (issue #9, reopened).** The capability test misses a
+terminal whose view reports a cursor — an SSH client can be a terminal on the screen and an ordinary
+editor to the connection, and Termius is exactly that. Such an app was handed
+`performContextMenuAction(paste)`, and a view of that kind does nothing with it; there is nothing to
+detect, because the call returns true whether or not the editor acted. So **paste**, and paste only,
+also asks whether the app is known as a terminal by name, and types the clipboard when it is. Every
+other answer still comes from the editor's shape, which is what keeps a plain text field inside a
+terminal app behaving like a plain text field.
+
+### 15.45 A shortcut the keyboard would not let you register
+
+**What happened.** Registering Shift+Space as the 한/영 key stored a lone left Shift. Two things ate
+the Space before the settings screen could see it. The capture was done in `onKeyDown`, which is the
+*last* stop on a key's way through an activity — the focused view sees it first, and the Add button
+that had just been pressed still had focus, where Space and Enter press the button. And once
+Shift+Space became a default binding, the keyboard itself took it: a bound key runs its function,
+which is exactly what the screen asking for it must prevent.
+
+**The fix.** Capture happens in `dispatchKeyEvent`, before any view; and while the screen is
+waiting, it sets `hw_capture_in_progress` in the shared preferences, which the service reads on
+every physical key and answers by passing everything through. The flag is cleared when the capture
+ends and again in `onPause`, so leaving mid-capture cannot leave the keyboard deaf.
+
+**And the defaults.** 한/영 now comes bound to Shift+Space, `KEYCODE_KANA` (218) and
+`KEYCODE_LANGUAGE_SWITCH` (204); 한자 to `KEYCODE_EISU` (212); Unicode entry to Ctrl+Shift+U. The
+odd-looking codes are Android's: its generic key layout maps Linux's HANGEUL and HANJA keys onto the
+Japanese KANA and EISU codes, which is what a Korean keyboard's own two keys arrive as. Defaults
+fill an *unset* preference, so a list emptied on purpose stays empty.
+
+**Rule.** A screen that asks "press the key you want" owns every key while it asks. Take the event
+before the views, and tell the rest of the app to stand aside.
+
+### 15.46 Text that was never copied
+
+**What was asked.** A keyboard reads the clipboard; on some ROMs it reads it while sitting in the
+background and files everything in a history the user cannot turn off. The request (issue #10) was
+not for a better clipboard but for a way round it: let an app **share** text to the keyboard, keep
+it in the keyboard's own storage, and type it when asked — without the clipboard being told
+anything.
+
+**What was built.** A share target (`ShareTargetActivity`, `ACTION_SEND` and `ACTION_PROCESS_TEXT`,
+no permissions, no screen) writes to `StashStore`, a preferences file of its own. The clip panel
+grew a second list above the clipboard's, drawn and behaving differently: picking a clip still puts
+it on the clipboard, picking a kept item only types it. `StashHistory` holds the rules — newest
+first, at most twenty, ages out on the user's clock (10 min / 1 h / 1 day / never), a repeat moves
+rather than duplicates — and is Android-free, so the rules are a unit test.
+
+**Its pair.** v0.1.180 had just made the keyboard read the clipboard every time it is shown, which
+is the opposite of what a user asking for this wants. So *Follow the system clipboard* is a setting
+(on by default): off, the keyboard never reads the clipboard at all, the panel says so rather than
+showing an empty list, and sharing is the only road in.
+
+**Rule.** When a platform's own channel is the problem, do not make it safer — offer a different
+channel and let the user pick.
+
+### 15.47 A format is a promise, so say as little as possible
+
+**What was asked.** A way to add a keyboard layout without waiting for a release: a file shared
+into the app (issue #11). The reporter offered JSON or something custom, and worried about
+copyright in copying another keyboard's arrangement.
+
+**What was built.** A line format with a header, a name, a three-letter cap and three `row:` lines
+whose cells are "what the key types" and, after a bar, what it holds. Nothing else: Shift,
+backspace, Enter, the bottom row and the layout key are the keyboard's own. One installed layout at
+a time, kept as its text in a preferences file of its own, parsed into `UserLayout` — Android-free,
+so the format is a unit test. It arrives through the share door the stash already opened: text that
+begins with the header is a layout, anything else is text to keep.
+
+**The rule that makes it survivable.** *Unknown lines are ignored, not refused.* A file written for
+a later ReteKey still works in this one, minus what this one cannot do. That single rule is what
+lets the format grow without breaking the promise, and it has its own test.
+
+**What the page still enforces.** The grid is ten columns whatever the file says: a short row is
+padded and a long one is cut. The first run on a device proved why — a three-key row threw
+`every row must span exactly 10 columns` out of `KeyboardLayout.of`, from inside the keyboard's own
+drawing, on a file a stranger wrote.
+
+**Rule.** Publish the smallest format that answers the request. Everything in it is a promise to
+read it for ever; everything left out is a decision you can still make later.
+
+### 15.48 Three calls an editor can get wrong
+
+**What happened.** Typing 신재님 on 나랏글 in one app, the 신 vanished the moment ㅈ was made
+(owner's report, 2026-09-17). ㅈ is ㅅ with a stroke, and the stroke asks for the syllable that the
+ㅅ closed back: the composer answered with three calls — clear the composition, delete one
+character, compose the pair again. Three calls in a row are three chances for an editor to be
+wrong about what the cursor and the composing region are, and the one that is wrong deletes the
+character before the composition and never puts it back. The same word in a plain `EditText`
+(emulator, the same build) came out right, which is what says the shape rather than the spelling
+was at fault.
+
+**The fix.** `RECOMPOSE_PREVIOUS`: take the characters behind the cursor — the composition included
+— back into the composing region and make them the new composition. `setComposingRegion` then
+`setComposingText`, no delete at all, so there is nothing to lose. Editors that will not mark a
+region say so by refusing, and the old three calls run for them; editors that never see a preedit
+(a terminal's strip, a remote desktop's commits) keep the shapes they already understand.
+
+**Rule.** Where a platform has one call for what you mean, do not spell it out in three. Every extra
+call is a place for an editor to disagree with you.
+
+### 15.49 A page cannot hold an alphabet, so let it be asked
+
+**What the request actually said.** The phonetic page answered "I want IPA symbols" (issue #11),
+but the reporter had also said *why* another keyboard's phonetic page went unused: "the symbols are
+hard to find". They typed saved phrases instead — "palm" for ɑ. That is a search, and a page with
+twenty-seven keys was never going to be the answer to a hundred and sixty symbols.
+
+**What was built.** One key on the page, two doors. **Tap** it and what is typed becomes a query:
+X-SAMPA codes (`T` is θ, and the capitals mean it — `t` is t), the symbol's own name (schwa, nasal,
+fricative), and for the English vowels Wells's lexical sets (PALM, THOUGHT, KIT), which is the
+vocabulary a dictionary reader already has. **Hold** it and the families are offered instead —
+vowels, plosives, fricatives… — and picking one shows its symbols. Two taps to anything, with the
+chart's own words as the map and nothing to memorise.
+
+**Where it is drawn.** The candidate panel the Hanja list already uses, but **above the keyboard**
+rather than floating over the document: a search is typed, so the keys have to stay in reach. The
+Hanja list keeps floating, because nothing is typed into it.
+
+**Two things the first device run taught.** Building the input view makes a *new* keyboard view, so
+a Shift lock set before the panel opens is gone after it — turn the page over afterwards. And the
+rebuild takes long enough under TCG that a probe tapping straight after it hits the old view; the
+same sequence typed by hand works. A test that races the rebuild is measuring the emulator.
+
+**Rule.** When a page cannot hold the domain, the keyboard's job is not a bigger page — it is a
+question the user can already phrase.
+
+### 15.50 Three things in one colour
+
+**What happened.** A held key is painted in the accent. So was the strip of alternates a hold
+raises, and so was the echo box over it. With a finger down and a strip up, nothing on screen said
+which of them was the choice being made (owner's request, 2026-09-18).
+
+**The fix.** Choosing has a hue of its own: the accent turned 210° round the circle, keeping the
+theme's saturation and lightness so it stays legible in light and dark and follows a Material You
+palette when the device sets one (`ChoiceHue`). The strip's aimed cell is painted in it, the rest
+tinted with it, and a character that was *chosen* — held for, flicked to, picked — is echoed in it
+too, where a pressed key still echoes in the accent.
+
+**And the box became a setting.** It is drawn over the keys, which is the point (a finger covers
+the key it presses) and also the objection (it can sit exactly where the next key is). So: on or
+off, and an opacity, with the keys reading through it. Its ink keeps at least
+`EchoBoxSettings.MIN_INK_OPACITY` of itself however faint the box is — at 35 % both faded together
+and neither the character nor the keys could be read (measured on the emulator).
+
+**What the owner changed after seeing it.** The box starts at 60 % rather than solid — it is over
+the keys, and the keys matter more than it does — and the app's own screen lost the ⚙ in front of
+its two settings entries. A glyph in front of a label is decoration where the label already says
+what it is.
+
+**Rule.** A colour is a name. Two different things in one colour is one thing without a name.
+
+### 15.51 A keyboard of white keys
+
+**What happened.** The light theme painted key faces in the lightest neutral there is — near-white
+by hand, `system_neutral1_50` under Material You — and the owner read the result as a sheet of
+paper rather than a set of keys (2026-09-18).
+
+**The fix.** One step down the ramp on both: hand-tuned faces at 238/240/244 over a 198/202/209
+ground, and the dynamic palette at `system_neutral1_100` over `system_neutral1_200`. The ladder is
+unchanged — face above ground, disabled below — so every other colour that is derived from them
+(the pressed tint, the choosing hue, the ink contrast) moves with it and nothing needed a second
+adjustment.
+
+**Rule.** Theme colours are a ladder, not a list. Move a rung, not a colour.
+
+### 15.52 A panel that asked for the whole screen
+
+**What happened.** Memo and Clip opened and closed again in the same breath in a terminal and in a
+chat app, and in the apps where they did open, the top of the panel sat *under* the status bar and
+the app below rearranged itself as if the keyboard had grown to fill the display. The reporter's
+screenshots showed both halves of it (issue #8).
+
+**Why.** The panels were measured at the height of the screen. An IME window is anchored to the
+bottom of the display, so a window that tall reaches up behind the system's own band at the top —
+that is the screenshot. And an app whose own area is squeezed to nothing by an input window can
+decide the input method is in the way and ask for it to be hidden; the keyboard goes down, the panel
+goes with it, and the next keystroke brings both back. That is the flicker.
+
+**The fix.** Measure the panel against the room an input method actually has: the screen, less the
+band at the top, less what the keyboard already reserves at the bottom, and never more than four
+fifths of the screen whatever the arithmetic says. Leaving a fifth to the app is what keeps the app
+from concluding it has no room left. The calculation is a class of its own with unit tests, and two
+device cells — the notepad and the clip list, opened inside real Termux and still open four seconds
+later — keep it honest.
+
+**Rule.** A window you do not own the rules for is not a canvas. Ask what is left after the system's
+furniture, leave the app enough to stay on its feet, and put the arithmetic somewhere a test can
+reach it.
+
+### 15.53 A chord that let go of only what went well
+
+**What happened.** The independent review of 2026-09-17 (finding R01) drove the remote-desktop
+chord through a fake editor that fails on cue. If the session ended right after Ctrl went down,
+the executor returned "not dispatched" before its release loop and Ctrl was never let up. If the
+editor refused Ctrl, the loop merely stopped pressing modifiers and still sent C — so Ctrl+C
+arrived as a bare `c` and was reported as a shortcut that worked.
+
+**Why.** The frame (§15a) was written for the path where every call succeeds. Its failure exits
+were early returns, the release loop sat after them, and it released every modifier in the frame
+rather than the ones actually pressed. A modifier press is a write to the far side like any other,
+but it was not guarded by the session check the key itself had.
+
+**The fix.** The chord owns what it pressed. A modifier is pressed only while the session is still
+this one; after a refused, throwing or stale press nothing more is pressed and the key is not sent.
+Every modifier that was pressed is released in a `finally`, in reverse, through the endpoint's own
+bridge — the connection it was pressed on, never whichever editor replaced it — and one release
+failing does not skip the next. The result counts the frame's calls, and anything short of a clean
+four-call chord is uncertain rather than dispatched, so the service does not hand the event on.
+A syllable written just before a key (the flush-then-key plan) keeps its count when the key fails.
+
+**Rule.** Whatever a sequence presses, the same sequence lets go of, on the same connection, in a
+`finally`. Test every call of it failing, not the one that happened to fail in the field.
+
+### 15.54 A replacement that committed after its delete failed
+
+**What happened.** The kana ゛゜小 key and a Hanja pick both replace text before the cursor: delete,
+then commit. Both wrote the calls straight onto the `InputConnection` (review R02): kana committed
+whether or not the delete happened, so a refused delete turned か into かが, and a throw skipped
+`endBatchEdit`. A Hanja pick replaced whatever was before the cursor when it was tapped, even if
+the cursor had moved or the field had changed since the candidates were offered.
+
+**The fix.** `TextReplacement` does both: begin, delete, commit, and always end, with the delete a
+prerequisite — nothing is committed after a delete that was refused or threw. A Hanja pick first
+checks that the reading it was offered for is still there: the same session generation, and the
+same text before the cursor (or the same selection). If not, the candidates close and nothing is
+written.
+
+**Rule.** A replacement is two edits with an order. Check the first before sending the second, and
+check that what you are replacing is still what you were asked to replace.
+
+### 15.55 The teardown behind the call that threw
+
+**What happened.** `onFinishInput` asked the editor to finish composing before it stopped the
+session. The call sat outside the `try/finally` that held the cleanup, so an editor throwing there
+skipped `stopAccepting` and `finishSession` alike (review R10) — the rule of §15.5, broken by its
+own first line. `onFinishInputView` had the same shape.
+
+**The fix.** `finishComposingInEditor` never throws, and both teardowns run the rest of their work in
+`finally` blocks behind it. The framework's own `onFinishInput` is one more `finishComposingText`,
+so an exception from it is caught too.
+
+**Rule.** In a teardown, the first line is a place to fail. Everything that must happen goes in a
+`finally` after it.
+
+### 15.56 A search that listened to only one keyboard
+
+**What happened.** With the phonetic search open, an on-screen letter joined the query and a
+physical letter was typed into the document (review R20). `onKeyDown` hid the candidate strip and
+carried on, leaving the search open with nothing showing — and the next field's first word then
+went into the query.
+
+**The fix.** `IpaKeyRoute` gives a physical key the answers an on-screen key gets: a letter joins
+the query, Backspace takes one back (and closes an empty search), Escape closes, digits and page
+keys stay with the candidates, a modifier alone passes (Shift is how a capital is typed), anything
+else closes the search and goes on as usual. A down the search used up has its up used up too.
+A new field, or the keyboard going away, ends the search.
+
+**Rule.** A mode that takes over typing takes over every way of typing, and ends at the edges of
+the field it was opened in.
+
+### 15.57 Gates that could not fail
+
+**What happened.** Two local gates reported what they had not checked (review R14, R15). The
+instrumentation runner still asked Gradle for task names that had become ambiguous when the
+modern/legacy flavors arrived, and installed APK paths that no longer existed — a leftover from
+an older build could have been the thing tested. The sentence matrix counted one row inside a
+command substitution, whose subshell threw the count away, so it could print FAIL and exit 0. The
+interaction matrix compared the keyboard to a size only one emulator has.
+
+**The fix.** The runner takes a flavor, deletes that variant's APKs before building, and installs
+nothing unless each APK sits beside build metadata naming its own variant. Every matrix row goes
+through one verdict function in the parent shell; a read that finds no log line is its own value,
+not an empty field; the exit status is 0 or 1. The geometry row measures the keyboard before and
+after the bar and compares the two. Each gate has a test that fails it one row at a time.
+
+**Rule.** A gate is only evidence if it has been seen to fail. Break each row on purpose once.
+
+### 15.58 Helpers that read a password field
+
+**What happened.** Composing in a password field was made to work (§15.30, issue #7), and the
+executor never reads a sensitive field's text. But the service reads the field directly in six
+places — select-word, the kana ゛゜小 key, the Hanja key, a Hanja pick's check that its reading is
+still there, the 나랏글 stroke on a written character, and the cursor check that reads the preedit
+back — and none of them asked whether the field was a password (review R03).
+
+**The fix.** One question, `mayReadEditorText()`, asked before every one of them. In a password
+field they do nothing; composing goes on, since it only ever uses what the keyboard itself holds.
+
+**Rule.** A privacy rule enforced in one path is a rule for that path. Put it in one place and have
+every read ask it.
+
+### 15.59 A clip that did not say it was a password
+
+**What happened.** Copying from a visible-password field put the text in the clip history (review
+R18, reproduced on a real EditText). The keyboard's own Copy key already refused to remember from a
+sensitive field, but the clipboard listener — which hears every copy, whichever app made it —
+judged a clip only by the copying app's marking, and a field's own Copy does not mark anything.
+
+**The fix.** `ClipRetentionGuard`: a clip is withheld when its app marked it, when the field being
+typed in is private (a password of any kind, or a field that asked for no personalised learning),
+or when a private field was left less than a second ago, because the listener can hear of a copy
+after the focus has moved on. A withheld clip stays withheld until the clipboard moves on, so the
+catch-up when the keyboard next appears cannot pick it up; only a digest of it is held.
+
+**Rule.** The clipboard does not say where a clip came from. The field the user was in does.
+
+### 15.60 A keyboard for the lock screen that opened the diary
+
+**What happened.** The service is direct-boot aware, so that there is a keyboard before the user
+first unlocks the phone. Its `onCreate` then opened the installed layout from ordinary
+SharedPreferences, which live in credential-encrypted storage — unavailable until unlock (review
+R04). Every setting, and the clip, stash and note histories, live there too.
+
+**The fix.** Until the first unlock the service's `getSharedPreferences` hands every caller —
+views and stores included, since they all reach storage through this context — preferences held in
+memory: defaults, nothing read, nothing written to disk. The clipboard is not recorded. Nothing
+personal is copied to device-protected storage to make the locked keyboard look like the unlocked
+one. At unlock — `ACTION_USER_UNLOCKED`, or the first storage read that finds the user unlocked,
+whichever comes first, once — the real settings are opened and the keyboard rebuilt. Anything
+written before that (a setting changed at the lock screen) is dropped by design.
+
+Also by design: in a field that asked for no personalised learning (an incognito tab) copies are
+not kept either, and in a terminal that declares a password variation the helpers of §15.58 stay
+out — Hanja, kana, select-word.
+
+**Rule.** Direct-boot aware means every storage path at startup answers "before unlock?" first.
+Plain defaults are a working keyboard; a copy of the user's data outside its encryption is not.
+
+### 15.61 Two notes written in the same minute
+
+**What happened.** A note's identity was its stamp, and the stamp is minutes: `20260713-1448`. Two
+notes written inside one minute were therefore one note to everything that looks a note up. Ticking
+one and deleting selected deleted both; editing one could land on the other; the arrows moved
+whichever came first (review R05).
+
+**The fix.** A note has an id of its own, made when the note is made and never shown. Opening,
+editing, selecting, moving and deleting all go by it. The stamp is what it always was on screen: a
+date. Notes written by the older build get an id from their place in the stored text, which is the
+same id every time that text is read.
+
+**Rule.** A timestamp is a fact about a record, not a name for it. Anything a user can make twice
+needs an identity that cannot collide.
+
+### 15.62 A separator inside the thing being separated
+
+**What happened.** The notes, the clip list and the shared-text stash were stored with U+001E
+between records and U+001F between fields, on the stated grounds that no keyboard types those.
+Text does not only come from a keyboard. Pasted or entered by code point, one U+001E split a note
+into two and cut its body; a clip or a shared item containing one was silently dropped on save,
+after the keyboard had shown it and said it was kept (review R06, R07).
+
+**The fix.** One form for all three lists: a header naming the number of fields, then every field
+written as its length, a colon and its text. Nothing inside a field can end it. The old form is
+still read, once; the text it came from is kept under `<key>_v1`, and the new text is written only
+when reading it back gives exactly what the old text gave. Text in the new form that does not read
+back as itself is kept under `<key>_damaged` and what could be read is used.
+
+**Rule.** "No one can type that character" is not a property of stored text. Say how long a field
+is instead of hoping nothing in it looks like the end.
+
+### 15.63 A panel holding yesterday's list
+
+**What happened.** The clip and stash panels were built from the lists the service held when they
+opened. Text shared into the keyboard while a panel stayed open went into the store, not into that
+copy — and forgetting one item from the panel wrote the copy back, erasing the newly shared text
+(review R19, reproduced on a device).
+
+**The fix.** Every change a panel makes starts from what is stored now: load, apply the change by
+its text, save. The panel's own copy is only what it draws.
+
+**Rule.** A view that has been open for a while holds a photograph. Never write a photograph back
+over the thing it was taken of.
+
+### 15.64 A layout that installed itself
+
+**What happened.** The layout door took what arrived and installed it. Any app that can offer a
+share could replace the keyboard's layout by sending one, and the only word about it was a toast
+afterwards (review R13). The parser was as trusting: `startsWith("retekey-layout 1")` accepted a
+file marked version 10, and a key was allowed to type two hundred thousand characters, split and
+stored (R09).
+
+**The fix.** The door asks. The name, the key cap, the first row of keys and the layout it would
+replace, with Install and Cancel; nothing is written until Install. A file is read off the main
+thread — somebody else's provider decides how long that takes — one byte past the ceiling, so a
+file over it is refused rather than read as the layout its beginning resembles. The version is the
+whole word, a byte-order mark before it is allowed, and the file, its lines and its keys have
+sizes derived from the layouts that already work: many times what any of them needs, and a file
+past them is refused with the reason rather than trimmed to fit.
+
+**Rule.** An exported door is an offer, not an instruction. Show what arrived, say what it would
+replace, and change nothing until the person whose keyboard it is says so.
+
+### 15.65 The cursor report from the middle of our own write
+
+**What happened.** Typing 자모통 into a remote desktop sometimes gave 자ㅁㅗ통 — the jamo of a
+syllable committed one by one instead of composed (owner's report, 2026-09-23).
+
+**Why.** In a window onto another machine there is no composing region, so a syllable is rewritten:
+delete what was materialised, commit the new form (§15a.1). That is two operations on the wire, and
+the client's own buffer reports where its cursor went after each of them. This keyboard remembered
+only where the *plan* would leave the cursor (§15a.5), so the report from the delete — a position
+one back — matched no expectation, was read as the user moving the cursor, and settled the syllable
+where it stood. The next jamo then had nothing to take back and was committed on its own. It was
+intermittent because the two operations usually sit in one batch and the client usually reports once,
+at its end; when the reports came separately, the syllable broke.
+
+**The fix.** Expect every step, not the end: the service walks the plan's actions and records the
+cursor each one leaves, so the delete's report is an expectation like any other. A report of the
+position our own last report already left it at — a client repeating itself, or one whose buffer has
+not caught up — is an echo too, not a move. A jump the writing cannot explain is still the user, and
+still settles the syllable.
+
+**Rule.** When one keystroke becomes several operations, the far side answers several times.
+Expect the whole path, not its end.
+
+### 15.66 A modifier nobody was holding any more
+
+**What happened.** Shift takes effect the moment the finger lands (§15.37), and a press that never
+lifts — the finger slid off the keyboard, the window went away, the page was rebuilt under it —
+only had its timers dropped. The latch it armed stayed armed, so the next unrelated key was
+shifted. The same for Ctrl, Alt and Meta; a tap that had *cleared* a lock left it cleared
+(review finding R11). On the physical side, a modifier held when a keyboard was unplugged, or when
+the field changed, was never let go of either: the keyboard went on believing Ctrl was down, so an
+arrow tapped on the action bar went out as Ctrl+arrow (R17).
+
+**The fix.** A press remembers what the latch held before it, and a canceled press puts that back —
+off if it was off, locked if it was locked. Where a key was typed while the finger was down the
+chord happened, so the one-shot is spent as a release spends it; where another finger is still on
+the same modifier, that finger owns the state. Rebuilding the page cancels the touches on it, which
+now means unwinding them. Physical modifiers are held per keyboard rather than per key code, so one
+keyboard's key-up cannot release another's; a keyboard that goes away takes its keys with it, a
+field boundary clears them all, and an ordinary key is believed about what it carries, which heals
+a key-up that never arrived.
+
+**Rule.** Whoever pressed it owns it. A press that does not end in a release ends in taking the
+press back, and a modifier belongs to the keyboard — or the finger — that is holding it.
+
+### 15.67 A panel that still had a parent
+
+**What happened.** The clipboard list and the notepad are kept in fields of the service, so what
+they hold survives the input view being built again. Every rebuild put the same panel into a new
+frame — and the old frame, no longer on screen but not gone, was still its parent. Android refuses
+that with `IllegalStateException: The specified child already has a parent`, and the IME crashed.
+Any rebuild with a panel open did it: pressing Memo with the clipboard open, or turning the screen
+(issue #12). Behind it was a second fault: with both fields set, the build showed the clipboard,
+and the notepad sat invisible behind it until the next Memo press closed a panel nobody could see.
+
+**The fix.** A kept panel leaves its old parent before it joins a new frame (`detached`), and the
+two panels replace each other: opening one puts the other away — the notepad saved first, as its
+own close does.
+
+**Rule.** A view that outlives its frame is detached before it is placed again. And one place on
+screen holds one thing: opening a panel closes whatever held that place, rather than leaving two
+flags set and the build choosing between them.
+
+### 15.68 A search typed into a view no longer on screen
+
+**What happened.** Closing the phonetic search rebuilt the input view without the candidate list,
+but left `hanjaView` pointing at the old list. The next search saw a list "already up", updated
+that one, and skipped the rebuild — so nothing appeared, while the search was open and took every
+letter as its query. The keyboard looked frozen in Shift, and typed nothing, until the user left
+the IME (issue #13).
+
+**The fix.** Every build starts by forgetting the last build's candidate view; the branches that
+show candidates make their own. The field now always means "the list in the tree on screen".
+
+**Rule.** A field that names a view names a view in the current tree. When a rebuild can leave it
+behind, the rebuild clears it — "already showing" must not be answered by a view that is not.
+
+### 15.69 A still keyboard with moving panels
+
+**What happened.** No motion (issue #15) was built into the keyboard view and the action bar: no
+press shade, no flash, no echo. The reply to the reporter said nothing would be shown and taken
+away. The notepad did not agree: its buttons were the platform's borderless buttons, which play a
+ripple on every press, its checkboxes drew their tick in, and its lists and the clipboard's glowed
+when scrolled to an end. A test counted nineteen of these in an empty notepad with No motion on.
+
+**The fix.** The notepad and the clipboard read the same switch. Under it a borderless button or a
+checkbox loses its ripple background (padding kept), a tick jumps to its end state when it changes,
+and a scroll view never draws its end glow.
+
+**Rule.** A display switch is about every surface the IME draws, not the one it was written for.
+Platform widgets bring their own motion; find it by counting — ripple backgrounds, animated
+drawables, over-scroll — in each panel with the switch on.
+
+## 15a. Remote-desktop editors: a wire with no editor behind it
+
+A remote-desktop client (Microsoft Remote Desktop, Chrome Remote Desktop) gives the IME an
+`InputConnection` like any editor, but there is no text view behind it. What sits behind it is a
+relay: a hidden dummy buffer on this side, and a real operating system on the far side of a
+network. Almost every assumption an IME makes about an editor fails against that shape, one at a
+time and each in its own way. ReteKey classifies these editors by package name and spent nine
+releases (v0.1.132–v0.1.145, 2026-08) learning what the wire actually honours. The findings, in
+the order they were paid for:
+
+### 15a.1 There is no composing region
+
+`setComposingText` "succeeds" against the dummy, but the far side never sees an underline and the
+next update corrupts what it did see. **Materialize composition as commits**: keep the preedit in
+the IME, and express each change as *delete what I materialized, commit the new form* — with the
+growth case (the new text extends the old) reduced to committing just the tail. The syllable 일
+becoming 이ㄹ on screen, and composition surviving the app's own selection reports, both trace
+back to pretending the composing region existed.
+
+### 15a.2 Two pipes, unordered — keep deletions with the commits
+
+The relay carries text operations (`commitText`, `deleteSurroundingText*`) and key events on
+separate paths, and nothing orders one against the other. A backspace sent as a DEL key event can
+land on the far side *after* a commit that was issued later — which eats the retyped syllable
+(the reported 앉). When the relay's buffer verifiably holds text (`getTextBeforeCursor` returns
+some), delete over the **text channel**, the same pipe the commits take; keep the key event as
+the fallback for an unknown or empty buffer. One ordered channel beats two fast ones.
+
+### 15a.3 Context-menu actions do nothing
+
+`performContextMenuAction(paste)` returns as if it worked and nothing happens — there is no
+`TextView` to act on. Editor commands must become what the far side understands: **key chords**
+(Ctrl+A/C/X/V/Z/Y), and word selection becomes the far side's own word-jump chords
+(Ctrl+Left, Ctrl+Shift+Right).
+
+### 15a.4 A large commit can vanish
+
+The relay reliably forwards what typing produces: one small commit per batch. A single
+`commitText` of a whole clipboard has been seen swallowed whole. **Type multi-character text
+out** — one code point per commit, each in its own batch — for anything that inserts more than a
+keystroke: a clip picked from the panel, a date tile, a paste of local text.
+
+### 15a.5 The soft path handles one event at a time — dress chords as hardware
+
+Injected chords failed twice before they worked, and each failure taught a property of the relay:
+
+- *Meta flag on the letter* (the shape a local `TextView` reads): the letter decodes to a control
+  character (Ctrl+B = 0x02) and the relay's soft path filters it as non-input. The far side
+  received Ctrl alone.
+- *Real modifier frame, bare letter* (Ctrl down → B down/up → Ctrl up): everything arrives, but
+  the soft path translates each event **alone** — the far side received a lone Ctrl tap and then
+  a plain letter. No cross-event modifier state is kept.
+
+A physical keyboard's Ctrl+A worked the whole time, because the relay has a second path for
+hardware events that *does* track modifier state and combine. The fix is to ride it: **dress the
+whole chord sequence as a physical keyboard's events** — `SOURCE_KEYBOARD`, real evdev scan codes
+(A=30, C=46, Ctrl=29 …), no `FLAG_SOFT_KEYBOARD`, and the meta flags kept on the letter. Local
+editors keep the plain soft shape; sending real modifier presses at a normal app can wake
+shortcuts you did not mean to press.
+
+### 15a.6 A success can be a mirage
+
+While chords were broken, Ctrl+A still "worked" — because the local dummy `EditText` performed
+its own select-all and the relay mirrored the *effect*. One key appearing to work while its
+neighbours fail is not evidence the pipe works for that key; it may be the dummy answering for
+itself. This mirage misdirected a whole release.
+
+### 15a.7 Measure the far side
+
+Every breakthrough in this chapter came from **running a key tester on the remote machine** and
+looking at what actually arrived: "Ctrl alone", "Ctrl, then a, separately", "Ctrl+A combined".
+Guessing from this side produced three plausible-but-wrong releases; one measurement on the far
+side settled each question in minutes. If a remote-desktop path misbehaves, instrument the far
+end first.
+
+### 15a.8 Clipboard sharing is the client's, and it works — measure before "fixing" it
+
+Copy and paste between a remote desktop and other Android apps was reported as not shared. Measured
+with the Microsoft client (Windows App 11.0.26071.13915) on the emulator against a Windows 11 VM,
+with a scheduled task in the session reading and setting its clipboard (2026-09-14):
+
+| Case | Result |
+|---|---|
+| Client's clipboard redirection **off** | nothing crosses, either way |
+| Redirection on, remote copy → Android | arrives, even with the client in the background |
+| Redirection on, copy in another app → return to the client | arrives within seconds of returning |
+| Copy in another app while the client stays in the background | does not cross until the client is in front — Android 10+ lets no background app read the clipboard |
+| The keyboard's bar Select all + Copy in a remote Notepad | reaches the remote and the Android clipboard |
+| Copy in another app, return, the keyboard's bar Paste | lands in the remote Notepad |
+
+So the sharing is the client's, switched per connection (a URI with `redirectclipboard:i:1` prompts
+for it), and the keyboard's chords take part in it correctly. An IME cannot read the remote
+clipboard at all. The one thing it could add is typing the Android clip on Paste instead of sending
+Ctrl+V — which crosses even with redirection off, but pastes a stale Android clip over a copy made
+inside the remote session; that is a setting to offer, not a default. On the emulator, the client's
+redirection prompt asks for all-files access through a settings screen the ATD image lacks and
+silently drops the connection; `appops set --uid com.microsoft.rdc.androidx MANAGE_EXTERNAL_STORAGE
+allow` first.
+
+## 16. Pre-release checklist
+
+- [ ] The IME appears in the keyboard list (manifest permission, action, and `method.xml` correct).
+- [ ] No code path refuses input because of internal cursor bookkeeping.
+- [ ] Typing, backspace, and Enter all work in a **terminal** app (`TYPE_NULL`, selection `-1`).
+- [ ] Composing is finished in `onFinishInput`, `onFinishInputView`, and on subtype change.
+- [ ] Ctrl/Alt/Meta chords still reach the app; bound IME shortcuts are intercepted before that.
+- [ ] Key handlers cannot throw out of the service.
+- [ ] The draw cache key covers layout, shift, modifiers, size, and theme — but not the pressed key.
+- [ ] Light and dark themes both render correctly, and switching rebuilds the keyboard.
+- [ ] Settings changes take effect on the live keyboard, not just after a restart.
+- [ ] Unit tests cover the Android-free core **and** parse the shipped data files.
+- [ ] Anything visual or input-interactive was verified on a real device, not an emulator.
+- [ ] Typing, backspace, chords, and paste were exercised in a **remote-desktop** client (§15a).
+- [ ] A candidates strip is visible with the keys up, docked and floating, and a hidden one takes no
+  room in any app (§10). Checked in the view tree, since no screen will show it on an emulator.
+- [ ] A panel the keyboard owns (notepad) consumes every key and editing command while it is open
+  (§15.31).
+- [ ] On-screen and action-bar keys chord with soft, bar and physical modifiers; held keys repeat
+  with the modifiers of the press (§15.32).
+- [ ] The clip list follows the system clipboard both ways and survives the keyboard restarting
+  (§15.33).
+- [ ] `InteractionMatrixTest` passes, and `scripts/interaction-matrix.sh` on the emulator lane
+  reports 0 failing cells (§14).
+- [ ] On the 12-key pages a near miss beside 123, Move or ⌫ types the Hangul key or space, and a 16
+  dp slide is a tap (§15.35).
+- [ ] A modifier rolled into a letter modifies that letter and not the next one, and a letter held
+  half a second is still a letter (§15.37, §15.38).
+- [ ] A panel the keyboard owns opens inside a terminal and a chat app and **stays** open, with the
+  system's band at the top still visible above it (§12a, §15.52).
+- [ ] Paste puts the clipboard into a terminal, into an app that is a terminal by name whatever its
+  field reports, and into an ordinary field by the editor's own paste (§15.44).
+- [ ] Text shared to the keyboard is kept and never touches the system clipboard, and a layout
+  arrives only through the door that installs one — including when the shared text begins with the
+  layout header (§15.46, §15.47).
+- [ ] A layout file somebody else wrote installs, appears in settings under its own name, and draws
+  the keys and holds the file names; the examples in `docs/user-layouts.md` still parse (§14).
+- [ ] A remote chord whose modifier or key fails releases every modifier it pressed and reports
+  uncertain, not dispatched; a kana or Hanja replacement whose delete fails commits nothing
+  (§15.53, §15.54).
+- [ ] The local gates fail when they should: `tests/test-ime-instrumentation-runner.sh` and
+  `tests/test-sentence-matrix.sh` pass, and the runner installs the flavor it built (§15.57).
+- [ ] In a password field no helper reads the field, a copy made there is not kept, and the keyboard
+  starts before the first unlock without opening its settings (§15.58–§15.60).
+- [ ] Notes, clips and shared text keep separators, tabs and emoji across a restart, two notes
+  made in one minute stay two, and a panel left open does not erase newer text (§15.61–§15.63).
+- [ ] A shared or opened layout installs nothing until Install is pressed, and a file with the
+  wrong version, an over-long key or no name is refused with its reason (§15.64).
+- [ ] A syllable typed into a remote desktop stays one syllable when its client reports a cursor
+  after every operation, not only at the end of a batch (§15.65).
+- [ ] A finger that slides off Shift, or a page rebuilt under it, leaves Shift as it was, and a
+  keyboard unplugged mid-chord stops arming the action bar's arrows (§15.66).
+- [ ] This manual, both languages, and the two READMEs were updated for whatever changed.

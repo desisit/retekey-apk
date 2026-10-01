@@ -1,0 +1,84 @@
+package com.retekey;
+
+public enum KeyboardLayoutId {
+    EN_QWERTY,
+    /** English Dvorak, on the same ten-column grid as QWERTY. */
+    EN_DVORAK,
+    /** English Colemak, on QWERTY's grid with the letters where Colemak puts them. */
+    EN_COLEMAK,
+    /** Spanish (Spain and Latin America): QWERTY with ñ ending the home row, accents held. */
+    ES_QWERTY,
+    /** Portuguese (Portugal and Brazil): QWERTY with the accents and ç held. */
+    PT_QWERTY,
+    /** Italian: QWERTY with the grave and acute vowels held. */
+    IT_QWERTY,
+    /** Polish: QWERTY with the ogonek, acute, stroke and dot letters held. */
+    PL_QWERTY,
+    /** Vietnamese Telex: QWERTY as is; the Telex composer makes the marks and tones. */
+    VI_TELEX,
+    /** German QWERTZ, ten columns: y and z swapped, ü ö ä ß held. */
+    DE_QWERTZ,
+    /** Turkish Q, ten columns: ü ı ö ş ğ ç held; Shift follows Turkish casing (i → İ, ı → I). */
+    TR_QWERTY,
+    /** Turkish F — the national standard arrangement, alongside the QWERTY-shaped Q. */
+    TR_F,
+    /** French AZERTY, 10/10/6: the accents held under the vowels and ç under c. */
+    FR_AZERTY,
+    /** Greek, on the PC layout's positions: ; ς up top, the tone vowels held. */
+    EL_QWERTY,
+    /** Hebrew, on the standard layout's positions; no case, so no Shift and a single page. */
+    HE_STANDARD,
+    /** Japanese by romaji: QWERTY as is, the composer turning it into hiragana. */
+    JA_ROMAJI,
+    /** Japanese on the 12-key flick pad, flick-only: tap あ, flick い う え お. */
+    JA_FLICK,
+    /** Persian on ISIRI 9147's positions, ten columns: the dotted twins and hamza forms as flicks. */
+    FA_ISIRI,
+    /** Thai on Kedmanee's positions: four letter rows, the Shift layer as upward flicks. */
+    TH_KEDMANEE,
+    /** Thai Pattachote — the ergonomic standard beside Kedmanee. */
+    TH_PATTACHOTE,
+    /** Hindi on InScript's positions: matra up to its vowel, plain up to its aspirate. */
+    HI_INSCRIPT,
+    /** Russian ЙЦУКЕН, its three rows plus a fourth for the letters ten columns squeeze out. */
+    RU_JCUKEN,
+    /** Russian phonetic, after Windows' own Mnemonic layout. Screen only for now. */
+    RU_PHONETIC,
+    /** Ukrainian: the ЙЦУКЕН frame with і ї є ґ. */
+    UK_JCUKEN,
+    /** Bulgarian Phonetic, the layout Bulgarian phones actually use. */
+    BG_PHONETIC,
+    /** Bulgarian BDS 5237 — the official standard, alongside the phonetic layout. */
+    BG_BDS,
+    /** Macedonian on its standard positions. */
+    MK_STANDARD,
+    /** Serbian Cyrillic on its standard positions. */
+    SR_CYRILLIC,
+    /** Arabic on the 101 layout's positions; the Shift layer's tashkil ride the flicks. */
+    AR_101,
+    /** Urdu on the phonetic layout's positions; the Shift layer's letters ride the flicks. */
+    UR_PHONETIC,
+    /** Georgian on its QWERTY-phonetic positions; no case, one page. */
+    KA_QWERTY,
+    /** Armenian (Eastern) on its typewriter positions. */
+    HY_EASTERN,
+    KO_DUBEOLSIK,
+    /** Korean 12-key with grouped consonants and the three vowel elements. */
+    KO_CHEONJIIN,
+    /** Korean 12-key with a consonant block and stroke/tense transformation keys. */
+    KO_NARATGEUL,
+    /** The cursor cluster on a 12-key pad, as a layout of its own rather than an overlay. */
+    PAD_ARROWS,
+    /** The phone keypad's digits on a 12-key pad, as a layout of its own. */
+    PAD_KEYPAD,
+    /** The IPA symbols, on the same ten-column grid; Shift turns the page over (issue #11). */
+    ETC_IPA,
+    /** A layout the user installed from a file of their own (issue #11). */
+    ETC_USER,
+    /** The special-characters page (reached by holding the period). */
+    SPECIAL_CHARS,
+    /** The special-keys page: keypad plus the special/function keys (reached by the pad key). */
+    SPECIAL_KEYS,
+    /** The menu-and-functions page (reached by the ☰ menu key). */
+    MENU
+}

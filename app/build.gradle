@@ -1,0 +1,127 @@
+plugins {
+    id "com.android.application"
+}
+
+// Release signing is configured only when a local, gitignored keystore.properties is present.
+// Public clones without it still build debug and unit tests; a release build there is unsigned.
+def keystorePropsFile = rootProject.file("keystore.properties")
+def keystoreProps = new Properties()
+if (keystorePropsFile.exists()) {
+    keystoreProps.load(new FileInputStream(keystorePropsFile))
+}
+
+android {
+    namespace = "com.retekey"
+    compileSdk = 36
+
+    defaultConfig {
+        applicationId = "com.retekey"
+        targetSdk = 36
+        versionCode = 203
+        versionName = "0.2.0"
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+    }
+
+    // Two builds of the same app. The code is identical — every call that needs a newer API is
+    // already behind a version check — so the flavors differ only in how far down they reach and
+    // in what they are called, which is what keeps the split from becoming two codebases.
+    flavorDimensions += "platform"
+
+    productFlavors {
+        modern {
+            dimension = "platform"
+            // Android 9 and up: the versions Google still ships security patches for.
+            minSdk = 28
+        }
+        legacy {
+            dimension = "platform"
+            // Android 4.0 and up, for the devices that are still in daily use and will never see
+            // another update. Everything works; a few things behave differently, and the README
+            // says which. API 11 is the real floor below this: no InputMethodSubtype, no
+            // modifier-key detection, no touchable region — features rather than fallbacks.
+            minSdk = 14
+            versionNameSuffix = "-legacy"
+        }
+    }
+
+    androidResources {
+        // The Hanja indexes are memory-mapped out of the APK at runtime, which only works if they
+        // are stored there uncompressed. It costs APK size and saves megabytes of heap.
+        noCompress += ["idx"]
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    signingConfigs {
+        if (keystorePropsFile.exists()) {
+            release {
+                storeFile rootProject.file(keystoreProps["storeFile"])
+                storePassword keystoreProps["storePassword"]
+                keyAlias keystoreProps["keyAlias"]
+                keyPassword keystoreProps["keyPassword"]
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            // Keep the git commit out of the APK. AGP embeds it in
+            // META-INF/version-control-info.textproto, which makes the APK depend on the checkout
+            // it was built from rather than on the source — the one thing that stopped a clean
+            // clone from reproducing the published build byte for byte, and F-Droid's reproducible
+            // build compares exactly that.
+            vcsInfo {
+                include = false
+            }
+            // Shrink with R8: the app is pure Java but AGP bundles kotlin-stdlib, so without
+            // shrinking the unused stdlib dominates the dex (~2 MB). R8 keeps only reachable code.
+            minifyEnabled true
+            shrinkResources true
+            proguardFiles getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro"
+            if (keystorePropsFile.exists()) {
+                signingConfig signingConfigs.release
+            }
+        }
+        instrumentation {
+            initWith debug
+            applicationIdSuffix = ".instrumentation"
+            versionNameSuffix = "-instrumentation"
+            matchingFallbacks = ["debug"]
+        }
+    }
+
+    testBuildType = "instrumentation"
+
+    dependenciesInfo {
+        // AGP writes a dependency-metadata block into the APK's signing block, encrypted so only
+        // Google Play can read it. F-Droid rejects opaque blobs no one else can inspect (their
+        // admin issue 367), and nothing here uses Play, so keep the APK free of it.
+        includeInApk = false
+        includeInBundle = false
+    }
+}
+
+androidComponents {
+    beforeVariants(selector().withBuildType("debug")) { variantBuilder ->
+        variantBuilder.enableUnitTest = true
+    }
+}
+
+java {
+    toolchain {
+        // The F-Droid buildserver provides Java 21 only (their default since January 2026) and
+        // does not auto-provision toolchains, so this pin must name what that machine has. The
+        // bytecode target stays 17 via compileOptions; releases must be built with the same major
+        // JDK so the published APK stays byte-identical to their rebuild.
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+}
+
+dependencies {
+    testImplementation "junit:junit:4.13.2"
+    androidTestImplementation "androidx.test:runner:1.7.0"
+    androidTestImplementation "androidx.test.ext:junit:1.3.0"
+}

@@ -1,0 +1,22 @@
+pluginManagement {
+    repositories {
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+    }
+}
+
+dependencyResolutionManagement {
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+rootProject.name = "retekey_ime"
+include ":app"
+// The T012 instrumentation host is a local-only module; include it only when present.
+if (file("testhost/build.gradle").exists()) {
+    include ":testhost"
+}

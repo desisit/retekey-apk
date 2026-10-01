@@ -1,0 +1,10 @@
+A key armed for one keystroke now takes the full accent colour instead
+of a pale wash you had to look for, and a pressed key goes further
+toward it. A key held down wears the same colours as the popup that
+shows each keystroke — accent behind, background-coloured letters — with
+its label outlined, so armed and held cannot be read as one.
+
+The space key shows the open box that has always meant one space. Keys
+read in English outside the Korean layouts, in words that shrink to fit
+the key: Undo, Redo, Copy, Cut, Paste, SelA, Date, Clip, Switch,
+Manage, Flt, Theme, Size−/Size+. The layout key says >qw for QWERTY.

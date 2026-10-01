@@ -1,0 +1,1225 @@
+package com.retekey;
+
+import android.app.Activity;
+import android.content.SharedPreferences;
+import android.os.Bundle;
+import android.util.DisplayMetrics;
+import android.util.TypedValue;
+import android.view.Gravity;
+import android.view.KeyEvent;
+import android.view.View;
+import android.widget.Button;
+import android.widget.CheckBox;
+import android.widget.LinearLayout;
+import android.widget.ScrollView;
+import android.widget.SeekBar;
+import android.widget.TextView;
+import com.retekey.HardwareKeyBindings.Binding;
+import java.util.ArrayList;
+import java.util.List;
+
+/**
+ * ReteKey's settings screen. Reachable from the app launcher, from the ☰ menu key on the keyboard,
+ * and from the system keyboard settings gear (declared as the input method's settingsActivity).
+ *
+ * <p>It uses only stock controls (text, sliders, a checkbox, buttons) and no hardcoded colors, so
+ * it follows the device's light/dark system theme. Values are stored in the same
+ * {@code retekey_view} preferences the keyboard reads, so changes take effect next time it shows.
+ */
+public final class SettingsActivity extends Activity {
+    private static final String PREFS = "retekey_view";
+
+    /**
+     * Names the screen an orientation page edits — {@link ScreenOrientation#name()}. Absent on
+     * the main page, which is how the two are told apart.
+     */
+    public static final String EXTRA_SCREEN = "com.retekey.settings.SCREEN";
+
+    /**
+     * Present when the page wanted is that screen's <em>layout list</em> rather than its
+     * settings. The list is one row per layout and there are many; a settings page must not be a
+     * scroll past it.
+     */
+    public static final String EXTRA_LAYOUTS = "com.retekey.settings.LAYOUTS";
+
+    /**
+     * Which screen this page edits. Set from {@link #EXTRA_SCREEN} on an orientation page; on the
+     * main page it is the device's current orientation, which nothing there reads.
+     */
+    private ScreenOrientation editing;
+    /** True on any of the four per-screen pages, false on the general page. */
+    private boolean orientationPage;
+    /** True on Layout (portrait) or Layout (landscape); false on an orientation's settings. */
+    private boolean layoutPage;
+    private SeekBar slider;
+    private TextView valueLabel;
+    private String capturingKey;
+    private TextView captureStatus;
+    private LinearLayout hanyeongList;
+    private LinearLayout hanjaList;
+    private LinearLayout unicodeList;
+    private LinearLayout layoutList;
+    /**
+     * The language groups the reader has opened on the layout page. Groups start shut: there are
+     * thirty-six layouts in a dozen families, and a list that begins by showing all of them is
+     * the thing this page was split off to stop being.
+     */
+    private final java.util.Set<String> openLanguages = new java.util.HashSet<>();
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        // Before any view exists: the theme is what the stock controls below take their colours
+        // from, and it is only ever different from the manifest's when the user has picked one.
+        ScreenTheme.apply(this);
+        super.onCreate(savedInstanceState);
+        String requested = getIntent() == null ? null : getIntent().getStringExtra(EXTRA_SCREEN);
+        orientationPage = requested != null;
+        layoutPage = orientationPage && getIntent().hasExtra(EXTRA_LAYOUTS);
+        editing = ScreenOrientation.LANDSCAPE.name().equals(requested)
+            ? ScreenOrientation.LANDSCAPE
+            : ScreenOrientation.PORTRAIT.name().equals(requested)
+                ? ScreenOrientation.PORTRAIT
+                : null;
+        if (editing == null) {
+            // The main page: nothing on it depends on which way the screen is held, but the
+            // oriented controls still need a value to read when this page is not showing them.
+            editing = OrientedPrefs.current(this);
+        }
+        setTitle(pageTitle());
+        buildUi();
+    }
+
+    /**
+     * Builds the whole screen. Called again when the user switches which orientation they are
+     * setting, because every oriented control then has a different value to show.
+     */
+    private void buildUi() {
+        LinearLayout root = new LinearLayout(this);
+        root.setOrientation(LinearLayout.VERTICAL);
+        int pad = dp(20);
+        root.setPadding(pad, pad, pad, pad);
+
+        // The screen is reachable from the launcher, the keyboard's menu, and the system keyboard
+        // settings, and the hardware Back key is not always at hand — a tablet with an external
+        // keyboard and gesture navigation has no visible one. Put the way out on the screen.
+        root.addView(backButton(), matchWidth());
+        if (getActionBar() != null) {
+            getActionBar().setDisplayHomeAsUpEnabled(true);
+        }
+
+        // Every page is built from SettingsOutline, which is also what the unit tests read.
+        List<SettingsOutline.Section> page = !orientationPage
+            ? SettingsOutline.MAIN
+            : layoutPage ? SettingsOutline.LAYOUT_PAGE : SettingsOutline.ORIENTATION_PAGE;
+        if (orientationPage) {
+            root.addView(sectionHint(pageHint()));
+        }
+        for (SettingsOutline.Section section : page) {
+            addSection(root, section);
+        }
+
+        // The controls are taller than a phone screen, so make the whole screen scroll.
+        ScrollView scroller = new ScrollView(this);
+        scroller.addView(root);
+        setContentView(scroller);
+        ScreenFit.apply(scroller, root);
+        if (orientationPage && !layoutPage) {
+            // Shows the stored height in the label the slider just got. No other page builds a
+            // height control, and storing one from those would be writing what they never read.
+            applyPercent(currentPercent());
+        }
+    }
+
+
+    /** Builds one section of the page. The order they arrive in is SettingsOutline's. */
+    private void addSection(LinearLayout root, SettingsOutline.Section section) {
+        switch (section) {
+            case HEIGHT:
+                addHeightControls(root);
+                break;
+            case KEY_WIDTH:
+                addKeyWidthControls(root);
+                break;
+            case LAYOUTS:
+                addLayoutControls(root);
+                break;
+            case FLOATING:
+                addFloatingControls(root);
+                break;
+            case THEME:
+                addThemeControls(root);
+                break;
+            case SYSTEM_BAND:
+                addSystemBandControls(root);
+                break;
+            case FEEDBACK:
+                addFeedbackControls(root);
+                break;
+            case REPEAT:
+                addRepeatControls(root);
+                break;
+            case HARDWARE:
+                addHardwareControls(root);
+                break;
+            case TERMINAL:
+                addTerminalControls(root);
+                break;
+            case CLIPBOARD:
+                addClipboardControls(root);
+                break;
+            case USER_LAYOUT:
+                addUserLayoutControls(root);
+                break;
+            case HARDWARE_LAYOUTS:
+                addHardwareLayoutControls(root);
+                break;
+            default:
+                break;
+        }
+    }
+
+    /**
+     * How much of the screen the keyboard takes, with its own Default beside it. That button used
+     * to sit alone at the foot of the page, where it read as a reset for everything on it.
+     */
+    private void addHeightControls(LinearLayout root) {
+        root.addView(sectionHeader(R.string.settings_height_label));
+        root.addView(sectionHint(R.string.settings_height_hint));
+
+        valueLabel = new TextView(this);
+        Compat.setTextAppearance(valueLabel, android.R.style.TextAppearance_DeviceDefault_Medium);
+        root.addView(valueLabel);
+
+        slider = new SeekBar(this);
+        rangeSlider(slider, KeyboardHeightPercent.MIN_PERCENT, KeyboardHeightPercent.MAX_PERCENT);
+        setSliderValue(slider, KeyboardHeightPercent.MIN_PERCENT, currentPercent());
+        slider.setPadding(dp(4), dp(12), dp(4), dp(12));
+        slider.setOnSeekBarChangeListener(new SimpleSeekBarListener() {
+            @Override
+            public void onProgressChanged(SeekBar bar, int progress, boolean fromUser) {
+                applyPercent(sliderValue(progress, KeyboardHeightPercent.MIN_PERCENT));
+            }
+        });
+        root.addView(slider, matchWidth());
+
+        Button reset = new Button(this);
+        reset.setText(R.string.settings_reset_height);
+        reset.setAllCaps(false);
+        reset.setOnClickListener(this::resetHeight);
+        LinearLayout.LayoutParams resetParams = new LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        resetParams.gravity = Gravity.END;
+        root.addView(reset, resetParams);
+    }
+
+    /** Visual horizontal width of each key; touch targets remain the full grid cells. */
+    private void addKeyWidthControls(LinearLayout root) {
+        root.addView(sectionHeader(R.string.settings_key_width_label));
+        root.addView(sectionHint(R.string.settings_key_width_hint));
+
+        TextView widthValue = new TextView(this);
+        Compat.setTextAppearance(widthValue, android.R.style.TextAppearance_DeviceDefault_Medium);
+        root.addView(widthValue);
+
+        SeekBar widthSlider = new SeekBar(this);
+        rangeSlider(widthSlider, KeyWidthSettings.MIN_PERCENT, KeyWidthSettings.MAX_PERCENT);
+        int current = KeyWidthSettings.percent(prefs(), editing);
+        setSliderValue(widthSlider, KeyWidthSettings.MIN_PERCENT, current);
+        widthValue.setText(getString(R.string.settings_key_width_value, current));
+        widthSlider.setPadding(dp(4), dp(12), dp(4), dp(12));
+        widthSlider.setOnSeekBarChangeListener(new SimpleSeekBarListener() {
+            @Override
+            public void onProgressChanged(SeekBar bar, int progress, boolean fromUser) {
+                int value = sliderValue(progress, KeyWidthSettings.MIN_PERCENT);
+                widthValue.setText(getString(R.string.settings_key_width_value, value));
+                if (fromUser) {
+                    KeyWidthSettings.setPercent(prefs(), editing, value);
+                }
+            }
+        });
+        root.addView(widthSlider, matchWidth());
+
+        Button reset = new Button(this);
+        reset.setText(R.string.settings_reset_key_width);
+        reset.setAllCaps(false);
+        reset.setOnClickListener(v -> {
+            KeyWidthSettings.setPercent(prefs(), editing, KeyWidthSettings.DEFAULT_PERCENT);
+            setSliderValue(widthSlider, KeyWidthSettings.MIN_PERCENT, KeyWidthSettings.DEFAULT_PERCENT);
+            widthValue.setText(getString(R.string.settings_key_width_value, KeyWidthSettings.DEFAULT_PERCENT));
+        });
+        LinearLayout.LayoutParams resetParams = new LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+        resetParams.gravity = Gravity.END;
+        root.addView(reset, resetParams);
+    }
+
+    /** What a key press does besides typing: a flash, a buzz, a click. */
+    private void addFeedbackControls(LinearLayout root) {
+        root.addView(sectionHeader(R.string.settings_feedback_label));
+        root.addView(sectionHint(R.string.settings_feedback_hint));
+        addPercentSlider(root, R.string.settings_visual,
+            KeyFeedback.KEY_VISUAL, KeyFeedback.DEFAULT_VISUAL);
+        addPercentSlider(root, R.string.settings_haptic,
+            KeyFeedback.KEY_HAPTIC, KeyFeedback.DEFAULT_HAPTIC);
+        addPercentSlider(root, R.string.settings_sound,
+            KeyFeedback.KEY_SOUND, KeyFeedback.DEFAULT_SOUND);
+
+        root.addView(flagBox(R.string.settings_still, PlainDisplay.KEY_STILL));
+        root.addView(sectionHint(R.string.settings_echo_hint));
+        CheckBox echo = new CheckBox(this);
+        echo.setText(R.string.settings_echo_enabled);
+        echo.setChecked(prefs().getBoolean(
+            EchoBoxSettings.KEY_ENABLED, EchoBoxSettings.DEFAULT_ENABLED));
+        echo.setOnCheckedChangeListener((b, checked) -> prefs().edit()
+            .putBoolean(EchoBoxSettings.KEY_ENABLED, checked).apply());
+        root.addView(echo);
+        addIntSlider(root, R.string.settings_echo_opacity, EchoBoxSettings.KEY_OPACITY,
+            EchoBoxSettings.MIN_OPACITY, EchoBoxSettings.MAX_OPACITY,
+            EchoBoxSettings.DEFAULT_OPACITY);
+    }
+
+    /** A titled percentage slider bound to an int preference clamped to [min, max]. */
+    private void addIntSlider(LinearLayout root, int titleRes, String prefKey,
+            int min, int max, int def) {
+        TextView label = new TextView(this);
+        label.setPadding(0, dp(10), 0, 0);
+        root.addView(label);
+
+        SeekBar bar = new SeekBar(this);
+        bar.setMax(max - min);
+        int start = Math.max(min, Math.min(max, prefs().getInt(prefKey, def)));
+        bar.setProgress(start - min);
+        bar.setPadding(dp(4), dp(8), dp(4), dp(8));
+        label.setText(getString(titleRes) + "  " + start + "%");
+        bar.setOnSeekBarChangeListener(new SimpleSeekBarListener() {
+            @Override
+            public void onProgressChanged(SeekBar b, int progress, boolean fromUser) {
+                int value = progress + min;
+                prefs().edit().putInt(prefKey, value).apply();
+                label.setText(getString(titleRes) + "  " + value + "%");
+            }
+        });
+        root.addView(bar, matchWidth());
+    }
+
+
+    /**
+     * How much room the system's own bottom buttons get. Automatic works it out from the insets,
+     * which is right on most phones and wrong on some; the other two are there because the owner of
+     * a phone can see what is under their keyboard and this screen cannot.
+     */
+    private void addSystemBandControls(LinearLayout root) {
+        root.addView(sectionHeader(R.string.settings_band_label));
+        root.addView(sectionHint(R.string.settings_band_hint));
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.addView(bandButton(SystemBarInsets.Mode.AUTOMATIC, R.string.settings_band_auto));
+        row.addView(bandButton(SystemBarInsets.Mode.ALWAYS, R.string.settings_band_always));
+        row.addView(bandButton(SystemBarInsets.Mode.NEVER, R.string.settings_band_never));
+        root.addView(row, matchWidth());
+
+        // What this phone actually reported, measured inside the keyboard's own window — the only
+        // place it can be measured, and not a place a settings screen can reach.
+        TextView measured = new TextView(this);
+        measured.setText(SystemBandSettings.lastSeen(this));
+        Compat.setTextAppearance(measured, android.R.style.TextAppearance_DeviceDefault_Small);
+        measured.setPadding(0, dp(8), 0, 0);
+        root.addView(measured, matchWidth());
+    }
+
+    private Button bandButton(SystemBarInsets.Mode mode, int titleRes) {
+        SystemBarInsets.Mode current = SystemBandSettings.mode(this);
+        Button button = new Button(this);
+        String title = getString(titleRes);
+        button.setText(current == mode ? "● " + title : title);
+        button.setAllCaps(false);
+        button.setEnabled(current != mode);
+        button.setOnClickListener(view -> {
+            SystemBandSettings.setMode(this, mode);
+            recreate();
+        });
+        button.setLayoutParams(new LinearLayout.LayoutParams(
+            0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+        return button;
+    }
+
+
+    /**
+     * Picks light, dark, or whatever the device is set to. The keyboard reads the same preference
+     * and repaints on its next appearance; this screen has to be built again to change its own
+     * theme, which {@link #recreate()} does with the scroll position and the whole state reset —
+     * acceptable for a setting that is by definition about how the screen looks.
+     */
+    private void addThemeControls(LinearLayout root) {
+        root.addView(sectionHeader(R.string.settings_theme_label));
+        root.addView(sectionHint(R.string.settings_theme_hint));
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.addView(themeButton(ThemeMode.SYSTEM, R.string.settings_theme_system));
+        row.addView(themeButton(ThemeMode.LIGHT, R.string.settings_theme_light));
+        row.addView(themeButton(ThemeMode.DARK, R.string.settings_theme_dark));
+        root.addView(row, matchWidth());
+        // Beside light and dark rather than instead of them: an E-Ink screen is paper-white, but
+        // a monochrome keyboard in the dark theme is white ink on black and just as plain.
+        root.addView(flagBox(R.string.settings_monochrome, PlainDisplay.KEY_MONOCHROME));
+    }
+
+    /** A checkbox for one of {@link PlainDisplay}'s switches. */
+    private CheckBox flagBox(int titleRes, String key) {
+        CheckBox box = new CheckBox(this);
+        box.setText(titleRes);
+        box.setChecked(prefs().getBoolean(key, false));
+        box.setOnCheckedChangeListener((b, checked) -> ScreenTheme.setFlag(this, key, checked));
+        return box;
+    }
+
+    private Button themeButton(ThemeMode mode, int titleRes) {
+        ThemeMode current = ScreenTheme.mode(this);
+        Button button = new Button(this);
+        String title = getString(titleRes);
+        // Marked in the label, for the same reason the orientation buttons are: this screen
+        // hardcodes no colour, so the mark has to survive any theme.
+        button.setText(current == mode ? "● " + title : title);
+        button.setAllCaps(false);
+        button.setEnabled(current != mode);
+        button.setOnClickListener(view -> {
+            ScreenTheme.setMode(this, mode);
+            recreate();
+        });
+        LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(
+            0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
+        button.setLayoutParams(params);
+        return button;
+    }
+
+    /**
+     * Which physical layout each on-screen layout uses. Only the layouts with more than one
+     * candidate appear: a language with a single physical form has nothing to choose, and a
+     * control with one value is a sentence pretending to be a setting. Today that is English —
+     * Korean joins it when a 3벌식 layout exists.
+     *
+     * <p>It sits here rather than in each layout's row on an orientation page because a physical
+     * keyboard is the same keyboard whichever way the phone is held: putting it there would put a
+     * setting that is not per orientation on a page that promises everything on it is.
+     */
+    private void addHardwareLayoutControls(LinearLayout root) {
+        List<KeyboardLayoutId> choosable = HardwareLayoutChoice.choosableLayouts();
+        if (choosable.isEmpty()) {
+            return;
+        }
+        root.addView(sectionHeader(R.string.settings_hwlayout_label));
+        root.addView(sectionHint(R.string.settings_hwlayout_hint));
+        for (KeyboardLayoutId screen : choosable) {
+            root.addView(hardwareLayoutRow(screen), matchWidth());
+        }
+    }
+
+    /** One on-screen layout, and a button per physical layout it can be paired with. */
+    private LinearLayout hardwareLayoutRow(KeyboardLayoutId screen) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.VERTICAL);
+        row.setPadding(0, dp(10), 0, dp(4));
+
+        TextView title = new TextView(this);
+        title.setText(getString(R.string.settings_hwlayout_row,
+            LetterLayouts.screenName(screen)));
+        row.addView(title);
+
+        LinearLayout buttons = new LinearLayout(this);
+        buttons.setOrientation(LinearLayout.HORIZONTAL);
+        KeyboardLayoutId chosen = HardwareLayoutChoice.resolve(
+            OrientedPrefs.getString(
+                prefs(), HardwareLayoutChoice.prefKey(screen), editing, null),
+            screen);
+        for (KeyboardLayoutId candidate : HardwareLayoutChoice.candidates(screen)) {
+            Button button = new Button(this);
+            String label = LetterLayouts.hardwareName(candidate);
+            // The chosen one is marked in the label itself: no colour is hardcoded on this
+            // screen, so the mark has to be something the theme cannot take away.
+            button.setText(candidate == chosen ? "\u25cf " + label : label);
+            button.setAllCaps(false);
+            button.setEnabled(candidate != chosen);
+            button.setOnClickListener(view -> {
+                OrientedPrefs.putString(
+                    prefs(), HardwareLayoutChoice.prefKey(screen), editing, candidate.name());
+                buildUi();
+            });
+            buttons.addView(button);
+        }
+        row.addView(buttons, matchWidth());
+        return row;
+    }
+
+    /** The name of this page, which is also how the reader knows what it is for. */
+    private int pageTitle() {
+        if (!orientationPage) {
+            return R.string.settings_title;
+        }
+        boolean landscape = editing == ScreenOrientation.LANDSCAPE;
+        if (layoutPage) {
+            return landscape
+                ? R.string.settings_layout_landscape_title
+                : R.string.settings_layout_portrait_title;
+        }
+        return landscape ? R.string.settings_landscape_title : R.string.settings_portrait_title;
+    }
+
+    /** The line under that name saying which screen it is about and what it holds. */
+    private int pageHint() {
+        boolean landscape = editing == ScreenOrientation.LANDSCAPE;
+        if (layoutPage) {
+            return landscape
+                ? R.string.settings_layout_landscape_hint
+                : R.string.settings_layout_portrait_hint;
+        }
+        return landscape ? R.string.settings_landscape_hint : R.string.settings_portrait_hint;
+    }
+
+
+    /** Returns to the app's main screen, whichever entry point opened these settings. */
+    private Button backButton() {
+        Button back = new Button(this);
+        // An orientation page was opened from the settings page, not from the main screen.
+        back.setText(orientationPage
+            ? R.string.settings_back_to_settings : R.string.settings_back);
+        back.setAllCaps(false);
+        // An orientation page came from the main settings page, so its way out is back to it.
+        back.setOnClickListener(view -> {
+            if (orientationPage) {
+                finish();
+            } else {
+                goToMainScreen();
+            }
+        });
+        return back;
+    }
+
+    private void goToMainScreen() {
+        android.content.Intent intent = new android.content.Intent(this, PreviewActivity.class);
+        // Reuse the existing main screen when it is already in the task instead of stacking a
+        // second copy behind this one.
+        intent.addFlags(android.content.Intent.FLAG_ACTIVITY_CLEAR_TOP
+            | android.content.Intent.FLAG_ACTIVITY_SINGLE_TOP);
+        try {
+            startActivity(intent);
+        } catch (RuntimeException ignored) {
+            // Nothing to fall back to; finishing still leaves the settings screen.
+        }
+        finish();
+    }
+
+    @Override
+    public boolean onOptionsItemSelected(android.view.MenuItem item) {
+        if (item.getItemId() == android.R.id.home) {
+            if (orientationPage) {
+                finish();
+                return true;
+            }
+            goToMainScreen();
+            return true;
+        }
+        return super.onOptionsItemSelected(item);
+    }
+
+    /** How solid the floating keyboard is; it is translucent so the app stays readable under it. */
+    /**
+     * A slider over {@code [min, max]}. {@code setMin} is API 26; below it the bar runs from zero
+     * and the caller shifts, which is what {@link #sliderValue} and {@link #setSliderValue} do.
+     */
+    private static void rangeSlider(SeekBar bar, int min, int max) {
+        if (Compat.canSetSeekBarMin()) {
+            bar.setMin(min);
+            bar.setMax(max);
+        } else {
+            bar.setMax(max - min);
+        }
+    }
+
+    private static int sliderValue(SeekBar bar, int min) {
+        return Compat.canSetSeekBarMin() ? bar.getProgress() : bar.getProgress() + min;
+    }
+
+    private static void setSliderValue(SeekBar bar, int min, int value) {
+        bar.setProgress(Compat.canSetSeekBarMin() ? value : value - min);
+    }
+
+    private static int sliderValue(int progress, int min) {
+        return Compat.canSetSeekBarMin() ? progress : progress + min;
+    }
+
+    private void addFloatingControls(LinearLayout root) {
+        root.addView(sectionHeader(R.string.settings_floating_label));
+        root.addView(sectionHint(R.string.settings_floating_hint));
+
+        CheckBox floating = new CheckBox(this);
+        floating.setText(R.string.settings_floating_enabled);
+        floating.setChecked(FloatingKeyboardSettings.isEnabled(prefs(), editing));
+        floating.setOnCheckedChangeListener((b, checked) ->
+            FloatingKeyboardSettings.setEnabled(prefs(), editing, checked));
+        root.addView(floating);
+
+        CheckBox follow = new CheckBox(this);
+        follow.setText(R.string.settings_panels_follow);
+        follow.setChecked(FloatingKeyboardSettings.panelsFollow(prefs(), editing));
+        follow.setOnCheckedChangeListener((b, checked) ->
+            FloatingKeyboardSettings.setPanelsFollow(prefs(), editing, checked));
+        root.addView(follow);
+
+        TextView label = new TextView(this);
+        Compat.setTextAppearance(label, android.R.style.TextAppearance_DeviceDefault_Medium);
+        root.addView(label);
+
+        SeekBar bar = new SeekBar(this);
+        int floor = FloatingKeyboardSettings.MIN_OPACITY_PERCENT;
+        rangeSlider(bar, floor, FloatingKeyboardSettings.MAX_OPACITY_PERCENT);
+        setSliderValue(bar, floor, FloatingKeyboardSettings.opacityPercent(prefs(), editing));
+        bar.setPadding(dp(4), dp(12), dp(4), dp(12));
+        label.setText(getString(R.string.settings_floating_value, sliderValue(bar, floor)));
+        bar.setOnSeekBarChangeListener(new SimpleSeekBarListener() {
+            @Override
+            public void onProgressChanged(SeekBar seekBar, int progress, boolean fromUser) {
+                int percent = sliderValue(progress, floor);
+                FloatingKeyboardSettings.setOpacityPercent(prefs(), editing, percent);
+                label.setText(getString(R.string.settings_floating_value, percent));
+            }
+        });
+        root.addView(bar, matchWidth());
+    }
+
+    /**
+     * Which letter layouts the globe key visits, and in what order. Each row can be turned on or
+     * off and moved up or down; the order shown is the order the globe key walks.
+     */
+    private void addLayoutControls(LinearLayout root) {
+        root.addView(sectionHeader(R.string.settings_layouts_label));
+        root.addView(sectionHint(R.string.settings_layouts_hint));
+        layoutList = new LinearLayout(this);
+        layoutList.setOrientation(LinearLayout.VERTICAL);
+        root.addView(layoutList, matchWidth());
+        refreshLayoutList();
+    }
+
+    private void refreshLayoutList() {
+        layoutList.removeAllViews();
+        List<KeyboardLayoutId> order = orderedLayouts();
+        for (KeyboardLayoutId id : order) {
+            layoutList.addView(layoutRow(id, order, true), matchWidth());
+        }
+        // The not-yet-enabled layouts, grouped by the language they write — thirty-plus rows
+        // read as a dozen families. Groups appear in the order their first layout appears.
+        java.util.LinkedHashMap<String, List<KeyboardLayoutId>> groups =
+            new java.util.LinkedHashMap<>();
+        for (KeyboardLayoutId id : LetterLayouts.ALL) {
+            if (!order.contains(id)) {
+                String tag = LetterLayouts.languageTag(id);
+                List<KeyboardLayoutId> group = groups.get(tag);
+                if (group == null) {
+                    group = new ArrayList<>();
+                    groups.put(tag, group);
+                }
+                group.add(id);
+            }
+        }
+        for (java.util.Map.Entry<String, List<KeyboardLayoutId>> entry : groups.entrySet()) {
+            String tag = entry.getKey();
+            boolean open = openLanguages.contains(tag);
+            layoutList.addView(
+                languageGroupHeader(tag, LetterLayouts.languageGroupLabel(tag),
+                    open, entry.getValue().size()),
+                matchWidth());
+            if (!open) {
+                continue;
+            }
+            for (KeyboardLayoutId id : entry.getValue()) {
+                layoutList.addView(layoutRow(id, order, false), matchWidth());
+            }
+        }
+    }
+
+    /**
+     * One language's heading on the layout page: a row that opens and shuts the layouts under it,
+     * saying how many there are and which way it is. Tapping the heading is the only control —
+     * the whole row is the target, so it does not need a finger's-width arrow of its own.
+     */
+    private TextView languageGroupHeader(String tag, String label, boolean open, int count) {
+        TextView header = new TextView(this);
+        header.setText(getString(open
+            ? R.string.settings_layouts_group_open
+            : R.string.settings_layouts_group_shut, label, count));
+        Compat.setTextAppearance(header, android.R.style.TextAppearance_DeviceDefault_Small);
+        header.setTypeface(header.getTypeface(), android.graphics.Typeface.BOLD);
+        header.setPadding(0, dp(10), 0, dp(2));
+        header.setMinHeight(dp(40));
+        header.setGravity(Gravity.CENTER_VERTICAL);
+        header.setClickable(true);
+        header.setFocusable(true);
+        android.util.TypedValue background = new android.util.TypedValue();
+        if (getTheme().resolveAttribute(
+                android.R.attr.selectableItemBackground, background, true)) {
+            header.setBackgroundResource(background.resourceId);
+        }
+        header.setOnClickListener(view -> {
+            if (!openLanguages.remove(tag)) {
+                openLanguages.add(tag);
+            }
+            refreshLayoutList();
+        });
+        return header;
+    }
+
+    private LinearLayout layoutRow(KeyboardLayoutId id, List<KeyboardLayoutId> order, boolean on) {
+        LinearLayout row = new LinearLayout(this);
+        row.setOrientation(LinearLayout.HORIZONTAL);
+        row.setGravity(Gravity.CENTER_VERTICAL);
+        // A row of its own height, so the names and the arrows do not sit on top of one another.
+        row.setMinimumHeight(dp(ROW_HEIGHT_DP));
+
+        CheckBox enabled = new CheckBox(this);
+        enabled.setText(LetterLayouts.screenName(id));
+        enabled.setChecked(on);
+        enabled.setOnClickListener(view -> toggleLayout(id));
+        row.addView(enabled, new LinearLayout.LayoutParams(
+            0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+
+        if (on) {
+            row.addView(moveButton("▲", id, -1, order.indexOf(id) > 0), moveButtonParams(true));
+            row.addView(moveButton("▼", id, 1, order.indexOf(id) < order.size() - 1),
+                moveButtonParams(false));
+        }
+        return row;
+    }
+
+    /** How tall a layout row is, and how big the arrow beside it is: a comfortable touch target. */
+    private static final int ROW_HEIGHT_DP = 48;
+    private static final int MOVE_BUTTON_DP = 44;
+
+    /**
+     * A square for the arrow, with air around it. A default Button is a slab: it carries a 64dp
+     * minimum width, its own padding and a background with built-in insets, which for a single
+     * glyph comes out both oversized and hard to tell apart from its neighbour. The size here is
+     * still above the 48dp touch target once the margins are counted, so it is no harder to hit.
+     */
+    private LinearLayout.LayoutParams moveButtonParams(boolean first) {
+        LinearLayout.LayoutParams params =
+            new LinearLayout.LayoutParams(dp(MOVE_BUTTON_DP), dp(MOVE_BUTTON_DP));
+        params.leftMargin = dp(first ? 8 : 4);
+        params.rightMargin = first ? 0 : dp(4);
+        return params;
+    }
+
+    private Button moveButton(String glyph, KeyboardLayoutId id, int delta, boolean usable) {
+        Button button = glyphButton(glyph, usable);
+        button.setOnClickListener(view -> moveLayout(id, delta));
+        return button;
+    }
+
+    /** A single-glyph borderless button, sized to a touch target without a Button's slab. */
+    private Button glyphButton(String glyph, boolean usable) {
+        // Borderless: the theme's own flat button, so the arrow reads as an arrow rather than as a
+        // second slab beside the layout's name, and still lights up under a finger.
+        Button button = new Button(this, null, android.R.attr.borderlessButtonStyle);
+        button.setText(glyph);
+        button.setEnabled(usable);
+        button.setAllCaps(false);
+        // A default Button reserves 64dp of width and its own padding; neither fits one glyph.
+        button.setMinimumWidth(0);
+        button.setMinimumHeight(0);
+        button.setMinWidth(0);
+        button.setMinHeight(0);
+        button.setPadding(0, 0, 0, 0);
+        button.setGravity(Gravity.CENTER);
+        button.setTextSize(TypedValue.COMPLEX_UNIT_SP, 15);
+        return button;
+    }
+
+    private void toggleLayout(KeyboardLayoutId id) {
+        List<KeyboardLayoutId> order = new ArrayList<>(orderedLayouts());
+        if (order.contains(id)) {
+            // The globe key must always have somewhere to go, so the last one stays on.
+            if (order.size() > 1) {
+                order.remove(id);
+            }
+        } else {
+            order.add(id);
+        }
+        storeLayouts(order);
+    }
+
+    private void moveLayout(KeyboardLayoutId id, int delta) {
+        List<KeyboardLayoutId> order = new ArrayList<>(orderedLayouts());
+        int from = order.indexOf(id);
+        int to = from + delta;
+        if (from < 0 || to < 0 || to >= order.size()) {
+            return;
+        }
+        order.remove(from);
+        order.add(to, id);
+        storeLayouts(order);
+    }
+
+    private void storeLayouts(List<KeyboardLayoutId> order) {
+        OrientedPrefs.putString(prefs(), LetterLayouts.KEY_ORDER, editing, LetterLayouts.format(order));
+        refreshLayoutList();
+    }
+
+    private List<KeyboardLayoutId> orderedLayouts() {
+        return LetterLayouts.parse(
+            OrientedPrefs.getString(prefs(), LetterLayouts.KEY_ORDER, editing, null));
+    }
+
+    /**
+     * The height set for the orientation being edited — which is not necessarily the one the
+     * device is being held in, so the screen height is the one that orientation would have.
+     */
+    private int currentPercent() {
+        DisplayMetrics metrics = getResources().getDisplayMetrics();
+        return KeyboardHeightPrefs.percent(
+            prefs(),
+            editing,
+            KeyboardHeightPrefs.screenHeightPx(editing, metrics),
+            Math.max(metrics.widthPixels, metrics.heightPixels),
+            metrics.density);
+    }
+
+    /**
+     * Stores a height and shows it. The label exists only where the height slider does — the main
+     * page has neither since the oriented settings moved to their own pages — so writing the
+     * value must not depend on having something to write it in.
+     */
+    private void applyPercent(int percent) {
+        int clamped = KeyboardHeightPercent.clamp(percent);
+        KeyboardHeightPrefs.setPercent(prefs(), editing, clamped);
+        if (valueLabel != null) {
+            valueLabel.setText(getString(R.string.settings_height_value, clamped));
+        }
+    }
+
+    /** Adds a titled 0–100% slider bound to a 0–1 float preference. */
+    private void addPercentSlider(LinearLayout root, int titleRes, String prefKey, float defaultValue) {
+        TextView label = new TextView(this);
+        label.setPadding(0, dp(10), 0, 0);
+        root.addView(label);
+
+        SeekBar bar = new SeekBar(this);
+        bar.setMax(100);
+        int start = Math.round(clampUnit(prefs().getFloat(prefKey, defaultValue)) * 100);
+        bar.setProgress(start);
+        bar.setPadding(dp(4), dp(8), dp(4), dp(8));
+        label.setText(getString(titleRes) + "  " + getString(R.string.settings_percent_value, start));
+        bar.setOnSeekBarChangeListener(new SimpleSeekBarListener() {
+            @Override
+            public void onProgressChanged(SeekBar b, int progress, boolean fromUser) {
+                prefs().edit().putFloat(prefKey, progress / 100.0f).apply();
+                label.setText(getString(titleRes) + "  "
+                    + getString(R.string.settings_percent_value, progress));
+            }
+        });
+        root.addView(bar, matchWidth());
+    }
+
+    private static float clampUnit(float value) {
+        if (Float.isNaN(value)) {
+            return 0.0f;
+        }
+        return Math.max(0.0f, Math.min(1.0f, value));
+    }
+
+    private void resetHeight(View view) {
+        DisplayMetrics metrics = getResources().getDisplayMetrics();
+        int fallback = KeyboardHeightPercent.defaultPercent(
+            KeyboardHeightPrefs.screenHeightPx(editing, metrics),
+            Math.max(metrics.widthPixels, metrics.heightPixels));
+        setSliderValue(slider, KeyboardHeightPercent.MIN_PERCENT, fallback);
+        applyPercent(fallback);
+    }
+
+    // ---- Held-key auto-repeat ----
+
+    private void addRepeatControls(LinearLayout root) {
+        root.addView(sectionHeader(R.string.settings_repeat_label));
+        root.addView(sectionHint(R.string.settings_repeat_hint));
+
+        CheckBox enabled = new CheckBox(this);
+        enabled.setText(R.string.settings_repeat_enabled);
+        enabled.setChecked(prefs().getBoolean(
+            KeyRepeatSettings.KEY_ENABLED, KeyRepeatSettings.DEFAULT_ENABLED));
+        enabled.setOnCheckedChangeListener((b, checked) ->
+            prefs().edit().putBoolean(KeyRepeatSettings.KEY_ENABLED, checked).apply());
+        root.addView(enabled);
+
+        addMsSlider(root, R.string.settings_repeat_delay, KeyRepeatSettings.KEY_DELAY_MS,
+            KeyRepeatSettings.MIN_DELAY_MS, KeyRepeatSettings.MAX_DELAY_MS,
+            KeyRepeatSettings.DEFAULT_DELAY_MS);
+        addMsSlider(root, R.string.settings_repeat_interval, KeyRepeatSettings.KEY_INTERVAL_MS,
+            KeyRepeatSettings.MIN_INTERVAL_MS, KeyRepeatSettings.MAX_INTERVAL_MS,
+            KeyRepeatSettings.DEFAULT_INTERVAL_MS);
+    }
+
+    // ---- Terminals ----
+
+    private void addTerminalControls(LinearLayout root) {
+        root.addView(sectionHeader(R.string.settings_terminal_label));
+        root.addView(sectionHint(R.string.settings_terminal_hint));
+
+        CheckBox onStrip = new CheckBox(this);
+        onStrip.setText(R.string.settings_terminal_on_strip);
+        onStrip.setChecked(prefs().getBoolean(
+            TerminalCompositionSettings.KEY_ON_STRIP,
+            TerminalCompositionSettings.DEFAULT_ON_STRIP));
+        onStrip.setOnCheckedChangeListener((b, checked) -> prefs().edit()
+            .putBoolean(TerminalCompositionSettings.KEY_ON_STRIP, checked).apply());
+        root.addView(onStrip);
+    }
+
+    // ---- The clipboard, and text shared into ReteKey ----
+
+    private void addClipboardControls(LinearLayout root) {
+        root.addView(sectionHeader(R.string.settings_clip_label));
+        root.addView(sectionHint(R.string.settings_clip_hint));
+
+        CheckBox follow = new CheckBox(this);
+        follow.setText(R.string.settings_clip_follow);
+        follow.setChecked(prefs().getBoolean(ReteKeyImeService.KEY_FOLLOW_CLIPBOARD, true));
+        follow.setOnCheckedChangeListener((b, checked) -> prefs().edit()
+            .putBoolean(ReteKeyImeService.KEY_FOLLOW_CLIPBOARD, checked).apply());
+        root.addView(follow);
+
+        root.addView(sectionHint(R.string.settings_stash_hint));
+        int[] choices = {10, 60, 1440, 0};
+        int[] labels = {R.string.settings_stash_10m, R.string.settings_stash_1h,
+            R.string.settings_stash_1d, R.string.settings_stash_forever};
+        int current = prefs().getInt(StashStore.KEY_MINUTES, StashHistory.DEFAULT_MINUTES);
+        final List<TextView> rows = new ArrayList<>(choices.length);
+        for (int i = 0; i < choices.length; i++) {
+            final int minutes = choices[i];
+            TextView row = new TextView(this);
+            row.setText(getString(labels[i]));
+            row.setPadding(0, dp(10), 0, dp(10));
+            row.setClickable(true);
+            rows.add(row);
+            row.setOnClickListener(v -> {
+                prefs().edit().putInt(StashStore.KEY_MINUTES, minutes).apply();
+                for (int j = 0; j < rows.size(); j++) {
+                    rows.get(j).setText((choices[j] == minutes ? "● " : "○ ")
+                        + getString(labels[j]));
+                }
+            });
+            root.addView(row);
+        }
+        for (int i = 0; i < rows.size(); i++) {
+            rows.get(i).setText((choices[i] == current ? "● " : "○ ") + getString(labels[i]));
+        }
+    }
+
+    // ---- The layout the user installed themselves ----
+
+    private void addUserLayoutControls(LinearLayout root) {
+        root.addView(sectionHeader(R.string.settings_layout_label));
+        root.addView(sectionHint(R.string.settings_layout_hint));
+
+        UserLayout installed = UserLayouts.load(this);
+        final TextView state = new TextView(this);
+        state.setPadding(0, dp(8), 0, dp(8));
+        state.setText(installed == null
+            ? getString(R.string.settings_layout_none)
+            : getString(R.string.settings_layout_installed, installed.name()));
+        root.addView(state);
+
+        if (installed != null) {
+            Button remove = new Button(this);
+            remove.setText(R.string.settings_layout_remove);
+            remove.setOnClickListener(v -> {
+                UserLayouts.remove(this);
+                state.setText(R.string.settings_layout_none);
+                remove.setEnabled(false);
+            });
+            root.addView(remove, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+        }
+
+        // A whole layout, on the screen where layouts are managed: the format is learned from the
+        // thing itself rather than from a description of it (the reporter of #11 asked for this).
+        // Selectable, so it can be copied straight out of here into a message or a file.
+        root.addView(sectionHint(R.string.settings_layout_example_hint));
+        TextView example = new TextView(this);
+        example.setText(UserLayout.EXAMPLE);
+        example.setTypeface(android.graphics.Typeface.MONOSPACE);
+        example.setTextIsSelectable(true);
+        example.setPadding(dp(10), dp(10), dp(10), dp(10));
+        root.addView(example, matchWidth());
+    }
+
+    /** A titled millisecond slider bound to an int preference clamped to [min, max]. */
+    private void addMsSlider(LinearLayout root, int titleRes, String prefKey,
+            int min, int max, int def) {
+        TextView label = new TextView(this);
+        label.setPadding(0, dp(10), 0, 0);
+        root.addView(label);
+
+        SeekBar bar = new SeekBar(this);
+        rangeSlider(bar, min, max);
+        int start = Math.max(min, Math.min(max, prefs().getInt(prefKey, def)));
+        setSliderValue(bar, min, start);
+        bar.setPadding(dp(4), dp(8), dp(4), dp(8));
+        label.setText(getString(titleRes) + "  " + getString(R.string.settings_ms_value, start));
+        bar.setOnSeekBarChangeListener(new SimpleSeekBarListener() {
+            @Override
+            public void onProgressChanged(SeekBar b, int progress, boolean fromUser) {
+                int value = sliderValue(progress, min);
+                prefs().edit().putInt(prefKey, value).apply();
+                label.setText(getString(titleRes) + "  "
+                    + getString(R.string.settings_ms_value, value));
+            }
+        });
+        root.addView(bar, matchWidth());
+    }
+
+    // ---- Physical-keyboard 한/영 and 한자 shortcuts ----
+
+    private void addHardwareControls(LinearLayout root) {
+        root.addView(sectionHeader(R.string.settings_hw_label));
+        root.addView(sectionHint(R.string.settings_hw_hint));
+
+        captureStatus = new TextView(this);
+        captureStatus.setPadding(0, dp(4), 0, dp(4));
+        captureStatus.setVisibility(View.GONE);
+        captureStatus.setOnClickListener(v -> stopCapture());
+        root.addView(captureStatus);
+
+        hanyeongList = addBindingGroup(root, R.string.settings_hw_hanyeong,
+            HardwareKeyBindings.KEY_HANYEONG);
+        hanjaList = addBindingGroup(root, R.string.settings_hw_hanja,
+            HardwareKeyBindings.KEY_HANJA);
+        unicodeList = addBindingGroup(root, R.string.settings_hw_unicode,
+            HardwareKeyBindings.KEY_UNICODE);
+
+        root.addView(sectionHint(R.string.settings_hw_hanja_note));
+        root.addView(sectionHint(R.string.settings_hw_unicode_note));
+
+        refreshBindings(HardwareKeyBindings.KEY_HANYEONG);
+        refreshBindings(HardwareKeyBindings.KEY_HANJA);
+        refreshBindings(HardwareKeyBindings.KEY_UNICODE);
+    }
+
+    private LinearLayout addBindingGroup(LinearLayout root, int titleRes, String prefKey) {
+        TextView label = new TextView(this);
+        label.setText(titleRes);
+        label.setPadding(0, dp(14), 0, 0);
+        root.addView(label);
+
+        LinearLayout list = new LinearLayout(this);
+        list.setOrientation(LinearLayout.VERTICAL);
+        root.addView(list);
+
+        Button add = new Button(this);
+        add.setText(R.string.settings_hw_add);
+        add.setOnClickListener(v -> startCapture(prefKey));
+        root.addView(add, new LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT));
+        return list;
+    }
+
+    private void refreshBindings(String prefKey) {
+        LinearLayout list = prefKey.equals(HardwareKeyBindings.KEY_HANYEONG) ? hanyeongList
+            : prefKey.equals(HardwareKeyBindings.KEY_UNICODE) ? unicodeList : hanjaList;
+        list.removeAllViews();
+        List<Binding> bindings = HardwareKeyBindings.parse(prefs().getString(prefKey, HardwareKeyBindings.defaultsFor(prefKey)));
+        if (bindings.isEmpty()) {
+            TextView none = new TextView(this);
+            none.setText(R.string.settings_hw_none);
+            none.setPadding(0, dp(4), 0, dp(4));
+            list.addView(none);
+            return;
+        }
+        for (Binding binding : bindings) {
+            LinearLayout row = new LinearLayout(this);
+            row.setOrientation(LinearLayout.HORIZONTAL);
+            row.setGravity(Gravity.CENTER_VERTICAL);
+
+            TextView name = new TextView(this);
+            name.setText(bindingLabel(binding));
+            Compat.setTextAppearance(name, android.R.style.TextAppearance_DeviceDefault_Medium);
+            row.addView(name, new LinearLayout.LayoutParams(
+                0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f));
+
+            Button remove = new Button(this);
+            remove.setText(R.string.settings_hw_remove);
+            remove.setOnClickListener(v -> removeBinding(prefKey, binding));
+            row.addView(remove);
+
+            list.addView(row);
+        }
+    }
+
+    private void startCapture(String prefKey) {
+        capturingKey = prefKey;
+        // Tell the keyboard to keep its hands off: a key that is already bound would otherwise do
+        // its job instead of being offered here.
+        prefs().edit().putBoolean(HardwareKeyBindings.KEY_CAPTURING, true).apply();
+        captureStatus.setText(R.string.settings_hw_capture);
+        captureStatus.setVisibility(View.VISIBLE);
+    }
+
+    private void stopCapture() {
+        capturingKey = null;
+        prefs().edit().putBoolean(HardwareKeyBindings.KEY_CAPTURING, false).apply();
+        if (captureStatus != null) {
+            captureStatus.setVisibility(View.GONE);
+        }
+    }
+
+    @Override
+    protected void onPause() {
+        super.onPause();
+        // Leaving the screen mid-capture must not leave the keyboard deaf.
+        if (capturingKey != null) {
+            stopCapture();
+        } else {
+            prefs().edit().putBoolean(HardwareKeyBindings.KEY_CAPTURING, false).apply();
+        }
+    }
+
+    private void addBinding(String prefKey, Binding binding) {
+        List<Binding> bindings = HardwareKeyBindings.parse(prefs().getString(prefKey, HardwareKeyBindings.defaultsFor(prefKey)));
+        HardwareKeyBindings.add(bindings, binding);
+        prefs().edit().putString(prefKey, HardwareKeyBindings.format(bindings)).apply();
+        refreshBindings(prefKey);
+    }
+
+    private void removeBinding(String prefKey, Binding binding) {
+        List<Binding> bindings = HardwareKeyBindings.parse(prefs().getString(prefKey, HardwareKeyBindings.defaultsFor(prefKey)));
+        bindings.remove(binding);
+        prefs().edit().putString(prefKey, HardwareKeyBindings.format(bindings)).apply();
+        refreshBindings(prefKey);
+    }
+
+    private String bindingLabel(Binding binding) {
+        StringBuilder sb = new StringBuilder();
+        if ((binding.mods & HardwareKeyBindings.MOD_CTRL) != 0) {
+            sb.append("Ctrl+");
+        }
+        if ((binding.mods & HardwareKeyBindings.MOD_SHIFT) != 0) {
+            sb.append("Shift+");
+        }
+        if ((binding.mods & HardwareKeyBindings.MOD_ALT) != 0) {
+            sb.append("Alt+");
+        }
+        if ((binding.mods & HardwareKeyBindings.MOD_META) != 0) {
+            sb.append("Meta+");
+        }
+        String name = KeyEvent.keyCodeToString(binding.keyCode);
+        if (name != null && name.startsWith("KEYCODE_")) {
+            name = name.substring("KEYCODE_".length());
+        }
+        sb.append(name);
+        return sb.toString();
+    }
+
+    /**
+     * While a shortcut is being captured, every key belongs to the capture.
+     *
+     * <p>It used to be caught in {@code onKeyDown}, which is the last stop on a key's way through
+     * an activity — the focused view sees it first. The Add button had focus, having just been
+     * pressed, and a button eats Space and Enter to press itself; Tab and the arrows move focus.
+     * So Shift+Space was registered as a lone left Shift: the Space never reached the activity at
+     * all, and the Shift's release did (owner's report, 2026-09-16). Taking the event in
+     * {@code dispatchKeyEvent} is taking it before any view can, which is what "press the shortcut
+     * you want" has to mean.
+     */
+    @Override
+    public boolean dispatchKeyEvent(KeyEvent event) {
+        if (capturingKey == null) {
+            return super.dispatchKeyEvent(event);
+        }
+        int keyCode = event.getKeyCode();
+        if (belongsToThePhone(keyCode)) {
+            stopCapture();
+            return super.dispatchKeyEvent(event);
+        }
+        if (event.getAction() == KeyEvent.ACTION_DOWN) {
+            if (KeyEvent.isModifierKey(keyCode)) {
+                // Wait: a plain modifier may be the start of a chord, or a lone-modifier binding
+                // captured on its release.
+                return true;
+            }
+            addBinding(capturingKey, new Binding(modsOf(event), keyCode));
+            stopCapture();
+            return true;
+        }
+        if (event.getAction() == KeyEvent.ACTION_UP && KeyEvent.isModifierKey(keyCode)) {
+            addBinding(capturingKey, new Binding(0, keyCode));
+            stopCapture();
+            return true;
+        }
+        return true;
+    }
+
+    /**
+     * Keys a shortcut may not be made of: the phone's own. They are let through untouched — Back
+     * then leaves the screen, which is how a capture started by mistake ends (the flag is cleared
+     * in {@link #onPause}).
+     */
+    private static boolean belongsToThePhone(int keyCode) {
+        switch (keyCode) {
+            case KeyEvent.KEYCODE_BACK:
+            case KeyEvent.KEYCODE_HOME:
+            case KeyEvent.KEYCODE_APP_SWITCH:
+            case KeyEvent.KEYCODE_POWER:
+            case KeyEvent.KEYCODE_VOLUME_UP:
+            case KeyEvent.KEYCODE_VOLUME_DOWN:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    private static int modsOf(KeyEvent event) {
+        int meta = event.getMetaState();
+        return HardwareKeyBindings.modsOf(
+            (meta & KeyEvent.META_SHIFT_ON) != 0,
+            (meta & KeyEvent.META_CTRL_ON) != 0,
+            (meta & KeyEvent.META_ALT_ON) != 0,
+            (meta & KeyEvent.META_META_ON) != 0);
+    }
+
+    private TextView sectionHeader(int textRes) {
+        TextView header = new TextView(this);
+        header.setText(textRes);
+        Compat.setTextAppearance(header, android.R.style.TextAppearance_DeviceDefault_Large);
+        header.setPadding(0, dp(28), 0, dp(2));
+        return header;
+    }
+
+    private TextView sectionHint(int textRes) {
+        TextView hint = new TextView(this);
+        hint.setText(textRes);
+        Compat.setTextAppearance(hint, android.R.style.TextAppearance_DeviceDefault_Small);
+        hint.setPadding(0, dp(4), 0, dp(8));
+        return hint;
+    }
+
+    private LinearLayout.LayoutParams matchWidth() {
+        return new LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT);
+    }
+
+    private SharedPreferences prefs() {
+        return getSharedPreferences(PREFS, MODE_PRIVATE);
+    }
+
+    private int dp(int value) {
+        return Math.round(value * getResources().getDisplayMetrics().density);
+    }
+
+    /** A {@link SeekBar.OnSeekBarChangeListener} with empty start/stop callbacks. */
+    private abstract static class SimpleSeekBarListener
+            implements SeekBar.OnSeekBarChangeListener {
+        @Override
+        public void onStartTrackingTouch(SeekBar bar) {
+        }
+
+        @Override
+        public void onStopTrackingTouch(SeekBar bar) {
+        }
+    }
+}

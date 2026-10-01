@@ -1,0 +1,56 @@
+# ── Public surface whitelist ────────────────────────────────────────────
+# This repository publishes only the buildable app plus README, LICENSE,
+# notices, and screenshots. Everything else (engineering docs, decisions,
+# changelog, the T012 instrumentation subsystem, and internal scripts) is
+# kept local / in a private companion repo and must not be pushed here.
+# Verify with: git ls-files  and a fresh-clone `./gradlew assembleDebug`.
+/*
+!/.gitignore
+!/README.md
+!/README.ko.md
+!/LICENSE
+!/THIRD_PARTY_NOTICES.md
+!/docs
+!/build.gradle
+!/settings.gradle
+!/gradle.properties
+!/gradlew
+!/gradlew.bat
+!/gradle
+!/app
+!/assets
+!/fastlane
+
+# gradle/: wrapper only
+/gradle/*
+!/gradle/wrapper
+
+# docs/: the public manuals only (Markdown)
+/docs/*
+!/docs/*.md
+# docs/fdroid/: the F-Droid recipe, kept beside the build it drives
+!/docs/fdroid
+
+# app/: build script, R8 rules, main sources, and JVM unit tests only
+/app/*
+!/app/build.gradle
+!/app/proguard-rules.pro
+!/app/src
+/app/src/*
+!/app/src/main
+!/app/src/test
+
+# never track build outputs or local config
+build/
+.gradle/
+.idea/
+local.properties
+*.apk
+*.aab
+.claude/
+
+# agy-only customization layer (local; see rootsator RFC-0001)
+/.agents/
+
+# GitHub Actions build workflow
+!/.github/

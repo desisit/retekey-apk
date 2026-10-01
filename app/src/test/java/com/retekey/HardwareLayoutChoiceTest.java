@@ -1,0 +1,153 @@
+package com.retekey;
+
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertTrue;
+
+import java.util.Arrays;
+import java.util.List;
+import org.junit.Test;
+
+/** Which physical layout is used while a given on-screen layout is showing. */
+public final class HardwareLayoutChoiceTest {
+
+    @Test
+    public void englishOffersTheThreeItHasAndEachAnswersToItself() {
+        List<KeyboardLayoutId> expected = Arrays.asList(
+            KeyboardLayoutId.EN_QWERTY, KeyboardLayoutId.EN_DVORAK, KeyboardLayoutId.EN_COLEMAK);
+        for (KeyboardLayoutId screen : expected) {
+            assertEquals(screen + " offers all three", expected,
+                HardwareLayoutChoice.candidates(screen));
+            assertTrue(screen + " is a choice", HardwareLayoutChoice.isChoosable(screen));
+            // Choosing Colemak on the screen and finding QWERTY under your fingers is not a sane
+            // default. English used to be the one language that did that, because before there
+            // were Dvorak and Colemak tables the caps as printed was all a keyboard could do.
+            assertEquals(screen + " answers to itself",
+                screen, HardwareLayoutChoice.defaultFor(screen));
+        }
+    }
+
+    @Test
+    public void aLayoutWithNoPhysicalFormFallsToItsLanguagesFirst() {
+        // 천지인 and 나랏글 are shapes for thumbs; no keyboard has them, so a physical keyboard
+        // types the one Korean layout that does exist.
+        assertEquals(KeyboardLayoutId.KO_DUBEOLSIK,
+            HardwareLayoutChoice.defaultFor(KeyboardLayoutId.KO_CHEONJIIN));
+        assertEquals(KeyboardLayoutId.KO_DUBEOLSIK,
+            HardwareLayoutChoice.defaultFor(KeyboardLayoutId.KO_NARATGEUL));
+    }
+
+    @Test
+    public void koreanHasOnePhysicalLayoutAndSoOffersNoChoice() {
+        // 천지인 and 나랏글 have no physical form; both already type 2벌식 on a real keyboard.
+        for (KeyboardLayoutId screen : Arrays.asList(KeyboardLayoutId.KO_DUBEOLSIK,
+                KeyboardLayoutId.KO_CHEONJIIN, KeyboardLayoutId.KO_NARATGEUL)) {
+            assertEquals(Arrays.asList(KeyboardLayoutId.KO_DUBEOLSIK),
+                HardwareLayoutChoice.candidates(screen));
+            assertFalse(screen + " has nothing to choose",
+                HardwareLayoutChoice.isChoosable(screen));
+            assertEquals(KeyboardLayoutId.KO_DUBEOLSIK, HardwareLayoutChoice.defaultFor(screen));
+        }
+    }
+
+    @Test
+    public void russianOffersNoChoiceBecauseItsPhoneticLayoutIsForTheScreenOnly() {
+        // Windows reaches five of that layout's letters through dead keys, which this keyboard
+        // has no composer for, so a physical keyboard keeps ЙЦУКЕН.
+        assertEquals(Arrays.asList(KeyboardLayoutId.RU_JCUKEN),
+            HardwareLayoutChoice.candidates(KeyboardLayoutId.RU_PHONETIC));
+        assertFalse(HardwareLayoutChoice.isChoosable(KeyboardLayoutId.RU_PHONETIC));
+        assertEquals(KeyboardLayoutId.RU_JCUKEN,
+            HardwareLayoutChoice.defaultFor(KeyboardLayoutId.RU_PHONETIC));
+    }
+
+    @Test
+    public void thaiOffersItsTwo() {
+        assertEquals(Arrays.asList(KeyboardLayoutId.TH_KEDMANEE, KeyboardLayoutId.TH_PATTACHOTE),
+            HardwareLayoutChoice.candidates(KeyboardLayoutId.TH_PATTACHOTE));
+        assertEquals(KeyboardLayoutId.TH_PATTACHOTE,
+            HardwareLayoutChoice.defaultFor(KeyboardLayoutId.TH_PATTACHOTE));
+    }
+
+    @Test
+    public void aLanguageWithOneScriptLayoutKeepsIt() {
+        // Ukrainian's physical layout is Ukrainian; there is no second way to type it here.
+        assertEquals(Arrays.asList(KeyboardLayoutId.UK_JCUKEN),
+            HardwareLayoutChoice.candidates(KeyboardLayoutId.UK_JCUKEN));
+        assertEquals(KeyboardLayoutId.UK_JCUKEN,
+            HardwareLayoutChoice.defaultFor(KeyboardLayoutId.UK_JCUKEN));
+        assertFalse(HardwareLayoutChoice.isChoosable(KeyboardLayoutId.UK_JCUKEN));
+    }
+
+    @Test
+    public void onlyTheLayoutsWithSomethingToChooseAreOffered() {
+        // The layout page lists these and nothing else: the languages that really do have more
+        // than one physical arrangement. A language with one has nothing to choose.
+        assertEquals(
+            Arrays.asList(KeyboardLayoutId.EN_QWERTY, KeyboardLayoutId.EN_DVORAK,
+                KeyboardLayoutId.EN_COLEMAK, KeyboardLayoutId.TR_QWERTY, KeyboardLayoutId.TR_F,
+                KeyboardLayoutId.TH_KEDMANEE, KeyboardLayoutId.TH_PATTACHOTE,
+                KeyboardLayoutId.BG_PHONETIC, KeyboardLayoutId.BG_BDS),
+            HardwareLayoutChoice.choosableLayouts());
+    }
+
+    @Test
+    public void turkishAndBulgarianEachOfferTheirTwo() {
+        // Turkish Q is the QWERTY-shaped one; F is the national standard. Bulgarian ships the
+        // phonetic layout its phones use and the official BDS 5237.
+        assertEquals(Arrays.asList(KeyboardLayoutId.TR_QWERTY, KeyboardLayoutId.TR_F),
+            HardwareLayoutChoice.candidates(KeyboardLayoutId.TR_F));
+        assertEquals(Arrays.asList(KeyboardLayoutId.BG_PHONETIC, KeyboardLayoutId.BG_BDS),
+            HardwareLayoutChoice.candidates(KeyboardLayoutId.BG_PHONETIC));
+        // Each keeps its own arrangement when nothing is chosen: a script layout always answered
+        // to its own table, and that must not change under anyone.
+        assertEquals(KeyboardLayoutId.TR_F,
+            HardwareLayoutChoice.defaultFor(KeyboardLayoutId.TR_F));
+        assertEquals(KeyboardLayoutId.BG_BDS,
+            HardwareLayoutChoice.defaultFor(KeyboardLayoutId.BG_BDS));
+        // And the pairing the owner asked for is possible: Q on the screen, F on the keys.
+        assertEquals(KeyboardLayoutId.TR_F,
+            HardwareLayoutChoice.resolve("TR_F", KeyboardLayoutId.TR_QWERTY));
+    }
+
+    @Test
+    public void aStoredChoiceIsUsedAndNonsenseFallsBack() {
+        assertEquals(KeyboardLayoutId.EN_COLEMAK,
+            HardwareLayoutChoice.resolve("EN_COLEMAK", KeyboardLayoutId.EN_DVORAK));
+        // Nothing stored yet: the screen layout answers to itself.
+        assertEquals(KeyboardLayoutId.EN_DVORAK,
+            HardwareLayoutChoice.resolve(null, KeyboardLayoutId.EN_DVORAK));
+        assertEquals(KeyboardLayoutId.EN_DVORAK,
+            HardwareLayoutChoice.resolve("", KeyboardLayoutId.EN_DVORAK));
+        // A name from another version, or one that is not a candidate for this language, falls
+        // back to that same default rather than to nothing.
+        assertEquals(KeyboardLayoutId.EN_DVORAK,
+            HardwareLayoutChoice.resolve("EN_WORKMAN", KeyboardLayoutId.EN_DVORAK));
+        assertEquals(KeyboardLayoutId.EN_DVORAK,
+            HardwareLayoutChoice.resolve("RU_JCUKEN", KeyboardLayoutId.EN_DVORAK));
+        // And a QWERTY screen still answers to QWERTY, which is the same rule.
+        assertEquals(KeyboardLayoutId.EN_QWERTY,
+            HardwareLayoutChoice.resolve(null, KeyboardLayoutId.EN_QWERTY));
+    }
+
+    @Test
+    public void eachScreenLayoutStoresItsOwnChoice() {
+        assertEquals("hardware_layout.EN_DVORAK",
+            HardwareLayoutChoice.prefKey(KeyboardLayoutId.EN_DVORAK));
+        assertFalse(HardwareLayoutChoice.prefKey(KeyboardLayoutId.EN_DVORAK)
+            .equals(HardwareLayoutChoice.prefKey(KeyboardLayoutId.EN_COLEMAK)));
+    }
+
+    @Test
+    public void capitalsMeanTheScreenAndLowerCaseMeansTheKeys() {
+        // The two are offered side by side now, so the abbreviation says which is which on its
+        // own — the layout key already paints the screen layout's three letters in capitals.
+        assertEquals("QWE-QWERTY", LetterLayouts.screenName(KeyboardLayoutId.EN_QWERTY));
+        assertEquals("qwe-QWERTY", LetterLayouts.hardwareName(KeyboardLayoutId.EN_QWERTY));
+        assertEquals("DVO-Dvorak", LetterLayouts.screenName(KeyboardLayoutId.EN_DVORAK));
+        assertEquals("cmk-Colemak", LetterLayouts.hardwareName(KeyboardLayoutId.EN_COLEMAK));
+        // The rest of the name is untouched, non-Latin scripts included.
+        assertTrue(LetterLayouts.screenName(KeyboardLayoutId.KO_DUBEOLSIK).startsWith("2BS-"));
+        assertTrue(LetterLayouts.hardwareName(KeyboardLayoutId.KO_DUBEOLSIK).startsWith("2bs-"));
+    }
+}
