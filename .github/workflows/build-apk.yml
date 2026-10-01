@@ -1,4 +1,4 @@
-name: Build ReteKey APK
+name: Build ReteKey APK (debug)
 
 on:
   workflow_dispatch:
@@ -42,8 +42,8 @@ jobs:
       - name: Make Gradle executable
         run: chmod +x gradlew
 
-      - name: Build unsigned release APKs
-        run: ./gradlew clean assembleRelease --stacktrace
+      - name: Build debug APKs
+        run: ./gradlew clean assembleDebug --stacktrace
 
       - name: Collect APKs
         run: |
@@ -54,6 +54,6 @@ jobs:
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: retekey-release-apks
+          name: retekey-debug-apks
           path: built-apks/*.apk
           if-no-files-found: error
