@@ -27,8 +27,8 @@ jobs:
       - name: Make Gradle executable
         run: chmod +x gradlew
 
-      - name: Build debug APKs
-        run: ./gradlew assembleDebug --stacktrace
+      - name: retekey-release-apks
+        run: ./gradlew clean assembleRelease --stacktrace
 
       - name: Collect APKs
         run: |
