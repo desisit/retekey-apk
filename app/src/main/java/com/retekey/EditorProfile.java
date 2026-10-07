@@ -119,6 +119,18 @@ public final class EditorProfile {
         );
     }
 
+    /** The same editor, with every delete sent as a backspace key event. */
+    public EditorProfile withKeyEventOnlyDelete() {
+        return new EditorProfile(
+            capabilities.withKeyEventOnlyDelete(),
+            multiline,
+            noEnterAction,
+            customActionPresent,
+            customActionId,
+            standardActionId
+        );
+    }
+
     /** The same editor, with the preedit kept on the keyboard's own strip instead of in it. */
     public EditorProfile composingOffScreen() {
         return new EditorProfile(

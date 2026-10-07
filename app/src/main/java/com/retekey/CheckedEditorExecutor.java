@@ -867,6 +867,12 @@ public final class CheckedEditorExecutor {
             // overtaken by the commit that follows it — so the erase character goes as text.
             return executeTerminalErase(endpoint, 1);
         }
+        if (capabilities.keyEventOnlyDelete()) {
+            // A web editor that keeps its own text model: the key event is the one delete it
+            // reads as a backspace, where a surrounding-text delete makes it rewrite the last
+            // character typed.
+            return executeRawDeleteFallback(endpoint, 0);
+        }
         if (capabilities.deleteByKeyEvents()) {
             // A remote-desktop editor relays over two pipes — text operations and key events —
             // and the pipes are not ordered against each other: a key-event backspace can land

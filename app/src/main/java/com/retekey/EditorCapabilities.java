@@ -34,6 +34,13 @@ public final class EditorCapabilities {
      */
     private boolean noSurroundingText;
     private boolean composesOffScreen;
+    /**
+     * Every delete is a backspace key event and never a surrounding-text call. For web editors
+     * (Monaco in a WebView, as in VS Code on Android): they keep their own model of the text and
+     * take a key event as the user's backspace, but read a surrounding-text delete as the
+     * composition changing and write the last typed character back.
+     */
+    private boolean keyEventOnlyDelete;
 
     private EditorCapabilities(
         boolean supported,
@@ -83,6 +90,21 @@ public final class EditorCapabilities {
         return copy;
     }
 
+    /** A copy whose every delete is a backspace key event (see {@link #keyEventOnlyDelete}). */
+    public EditorCapabilities withKeyEventOnlyDelete() {
+        EditorCapabilities copy = new EditorCapabilities(
+            supported, sensitive, allowLegacyCodeUnitFallback, allowRawDeleteFallback, deletionMode);
+        copy.deleteByKeyEvents = true;
+        copy.keyEventOnlyDelete = true;
+        copy.noSurroundingText = noSurroundingText;
+        copy.composesOffScreen = composesOffScreen;
+        return copy;
+    }
+
+    public boolean keyEventOnlyDelete() {
+        return keyEventOnlyDelete;
+    }
+
     public boolean deleteByKeyEvents() {
         return deleteByKeyEvents;
     }
@@ -112,6 +134,7 @@ public final class EditorCapabilities {
             supported, sensitive, allowLegacyCodeUnitFallback, allowRawDeleteFallback, deletionMode);
         copy.deleteByKeyEvents = deleteByKeyEvents;
         copy.noSurroundingText = noSurroundingText;
+        copy.keyEventOnlyDelete = keyEventOnlyDelete;
         copy.composesOffScreen = true;
         return copy;
     }

@@ -869,6 +869,13 @@ public final class SettingsActivity extends Activity {
         onStrip.setOnCheckedChangeListener((b, checked) -> prefs().edit()
             .putBoolean(TerminalCompositionSettings.KEY_ON_STRIP, checked).apply());
         root.addView(onStrip);
+
+        CheckBox keyDelete = new CheckBox(this);
+        keyDelete.setText(R.string.settings_key_event_delete);
+        keyDelete.setChecked(prefs().getBoolean(TerminalCompositionSettings.KEY_KEY_EVENT_DELETE, false));
+        keyDelete.setOnCheckedChangeListener((b, checked) -> prefs().edit()
+            .putBoolean(TerminalCompositionSettings.KEY_KEY_EVENT_DELETE, checked).apply());
+        root.addView(keyDelete);
     }
 
     // ---- The clipboard, and text shared into ReteKey ----

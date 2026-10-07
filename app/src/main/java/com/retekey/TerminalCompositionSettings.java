@@ -12,6 +12,8 @@ package com.retekey;
  */
 public final class TerminalCompositionSettings {
     static final String KEY_ON_STRIP = "terminal_compose_on_strip";
+    /** Send every backspace as a key event: for code editors in a WebView, such as VS Code. */
+    static final String KEY_KEY_EVENT_DELETE = "delete_by_key_event_only";
 
     /** The strip: no take-backs, and the syllable appears in the terminal when it closes. */
     public static final boolean DEFAULT_ON_STRIP = true;

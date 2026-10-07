@@ -1468,6 +1468,11 @@ public class ReteKeyImeService extends InputMethodService {
             attribute,
             Build.VERSION.SDK_INT
         );
+        if (keyEventOnlyDeleteWanted()
+                && editorProfile.capabilities().hasSurroundingText()
+                && !editorProfile.capabilities().deleteByKeyEvents()) {
+            editorProfile = editorProfile.withKeyEventOnlyDelete();
+        }
         if (TerminalCompositionSettings.appliesTo(editorProfile, composeTerminalOnStrip())) {
             editorProfile = editorProfile.composingOffScreen();
         }
@@ -1591,6 +1596,15 @@ public class ReteKeyImeService extends InputMethodService {
     }
 
     /** Where a terminal's half-built syllable is shown — the keyboard's strip, or the terminal. */
+    /** The user's switch for web editors that misread a surrounding-text delete. */
+    private boolean keyEventOnlyDeleteWanted() {
+        try {
+            return viewPrefs().getBoolean(TerminalCompositionSettings.KEY_KEY_EVENT_DELETE, false);
+        } catch (RuntimeException unavailable) {
+            return false;
+        }
+    }
+
     private boolean composeTerminalOnStrip() {
         try {
             return viewPrefs().getBoolean(
