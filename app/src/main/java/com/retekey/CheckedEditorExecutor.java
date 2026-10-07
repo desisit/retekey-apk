@@ -327,7 +327,9 @@ public final class CheckedEditorExecutor {
         //   Ctrl+A 는 되므로, 프레임 있는 코드는 이벤트를 **물리 키보드 모양**(키보드 source,
         //   실제 스캔코드, 소프트 플래그 제거)으로 입혀 릴레이의 하드웨어 경로 — 수식 상태를
         //   추적해 조합하는 경로 — 를 타게 한다. 글자에는 meta 도 도로 싣는다.
-        boolean dressAsHardware = !frame.isEmpty();
+        // A web editor in key-event mode (VS Code in a WebView) gets every key dressed the same
+        // way: it handles a keyboard's Tab and Backspace but ignores the soft-keyboard flag.
+        boolean dressAsHardware = !frame.isEmpty() || capabilities.keyEventOnlyDelete();
         // The chord owns every modifier it pressed until it has let it go (review R01). A press
         // is attempted only while the session is still this one, and after a refused, throwing
         // or stale press nothing more is pressed: Ctrl+C whose Ctrl failed must not arrive as a
@@ -871,7 +873,7 @@ public final class CheckedEditorExecutor {
             // A web editor that keeps its own text model: the key event is the one delete it
             // reads as a backspace, where a surrounding-text delete makes it rewrite the last
             // character typed.
-            return executeRawDeleteFallback(endpoint, 0);
+            return executeRawDeleteFallback(endpoint, 0, true);
         }
         if (capabilities.deleteByKeyEvents()) {
             // A remote-desktop editor relays over two pipes — text operations and key events —
@@ -1029,11 +1031,19 @@ public final class CheckedEditorExecutor {
         EditorEndpoint endpoint,
         int priorOperationCount
     ) {
+        return executeRawDeleteFallback(endpoint, priorOperationCount, false);
+    }
+
+    private static ActionExecution executeRawDeleteFallback(
+        EditorEndpoint endpoint,
+        int priorOperationCount,
+        boolean asHardware
+    ) {
         EditorBridge bridge = endpoint.bridge();
-        EditorCallResult down = guardedCall(endpoint, () -> bridge.sendRawKey(RawEditorKey.of(
-            RawKey.BACKSPACE,
-            RawEditorKey.Action.DOWN
-        )));
+        EditorCallResult down = guardedCall(endpoint, () -> bridge.sendRawKey(asHardware
+            ? RawEditorKey.hardware(RawKey.BACKSPACE, java.util.Collections.emptySet(),
+                RawEditorKey.Action.DOWN)
+            : RawEditorKey.of(RawKey.BACKSPACE, RawEditorKey.Action.DOWN)));
         if (down.isStaleSession()) {
             return ActionExecution.failure(
                 ExecutionResult.Reason.SESSION_CHANGED_DURING_EXECUTION,
@@ -1041,10 +1051,10 @@ public final class CheckedEditorExecutor {
                 false
             );
         }
-        EditorCallResult up = safeCall(() -> bridge.sendRawKey(RawEditorKey.of(
-            RawKey.BACKSPACE,
-            RawEditorKey.Action.UP
-        )));
+        EditorCallResult up = safeCall(() -> bridge.sendRawKey(asHardware
+            ? RawEditorKey.hardware(RawKey.BACKSPACE, java.util.Collections.emptySet(),
+                RawEditorKey.Action.UP)
+            : RawEditorKey.of(RawKey.BACKSPACE, RawEditorKey.Action.UP)));
         int operationCount = priorOperationCount + 2;
         if (down.isSucceeded() && up.isSucceeded()) {
             return ActionExecution.dispatched(1, operationCount);
