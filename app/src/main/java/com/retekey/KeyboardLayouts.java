@@ -69,6 +69,15 @@ public final class KeyboardLayouts {
      */
     private static final String[] HOLDS_10_10_6 = {HOLD_DIGITS, HOLD_SYMBOLS + "'", HOLD_MARKS};
 
+    /** Columns of the Samsung-style letter grid: two per key, so a row can start half a key in. */
+    static final int SAMSUNG_COLUMNS = 20;
+    /** Samsung's number row is a little shorter than the letter rows; the rest are equal. */
+    private static final float[] SAMSUNG_ROW_WEIGHTS = {0.83f, 1.0f, 1.0f, 1.0f, 1.0f};
+    /** Space above and below each key face, in dp: Samsung leaves about twelve between rows. */
+    private static final float SAMSUNG_VERTICAL_GAP_DP = 6.0f;
+    /** Digits, then three groups of alternates for the letter rows (the number row has none). */
+    private static final String[] HOLDS_SAMSUNG = {"", "", HOLD_SYMBOLS, HOLD_MARKS};
+
     private static final KeyboardLayout EN_BASE = english(false);
     private static final KeyboardLayout EN_SHIFTED = english(true);
     private static final KeyboardLayout KO_BASE = korean(false);
@@ -767,7 +776,7 @@ public final class KeyboardLayouts {
             digits.add(letter(String.valueOf(c), false));
         }
         rows.add(KeyboardLayout.row(digits.toArray(new SoftwareKeySpec[0])));
-        KeyboardLayout qwerty = of(KeyboardLayoutId.EN_QWERTY, false);
+        KeyboardLayout qwerty = englishClassic(false);
         rows.add(qwerty.rows().get(0));
         rows.add(qwerty.rows().get(1));
         rows.add(qwerty.rows().get(2));
@@ -777,7 +786,62 @@ public final class KeyboardLayouts {
 
     // ---- Letter pages ----
 
+    /** One key of the Samsung grid is two columns wide. */
+    private static SoftwareKeySpec key2(SoftwareKeySpec key) {
+        return key.withColumnSpan(2);
+    }
+
+    private static SoftwareKeySpec edgeSpacer() {
+        return SoftwareKeySpec.disabled("touch.gap.edge", " ").withColumnSpan(1);
+    }
+
+    /**
+     * English QWERTY in Samsung's shape: a number row, QWERTY, a home row indented half a key,
+     * Shift and Backspace flanking Z–M, and a bottom row of symbols, language, space, period and
+     * Enter. Ctrl, Alt, Tab and the rest leave the bottom row; they live in the ⋯ panel.
+     */
     private static KeyboardLayout english(boolean shifted) {
+        List<List<SoftwareKeySpec>> rows = new ArrayList<>(4);
+        List<SoftwareKeySpec> digits = new ArrayList<>(10);
+        for (char c : "1234567890".toCharArray()) {
+            digits.add(key2(digit("num" + c, String.valueOf(c))));
+        }
+        rows.add(digits);
+        List<SoftwareKeySpec> top = new ArrayList<>(10);
+        for (char c : "qwertyuiop".toCharArray()) {
+            top.add(key2(letter(String.valueOf(c), shifted)));
+        }
+        rows.add(top);
+        List<SoftwareKeySpec> home = new ArrayList<>(11);
+        home.add(edgeSpacer());
+        for (char c : "asdfghjkl".toCharArray()) {
+            home.add(key2(letter(String.valueOf(c), shifted)));
+        }
+        home.add(edgeSpacer());
+        rows.add(home);
+        List<SoftwareKeySpec> bottom = new ArrayList<>(9);
+        bottom.add(shiftKey(shifted).withColumnSpan(3));
+        for (char c : "zxcvbnm".toCharArray()) {
+            bottom.add(key2(letter(String.valueOf(c), shifted)));
+        }
+        bottom.add(backspaceKey().withColumnSpan(3));
+        rows.add(bottom);
+        rows = new ArrayList<>(withHolds(rows, HOLDS_SAMSUNG));
+        rows.add(KeyboardLayout.row(
+            specialCharsKey().withColumnSpan(3),
+            layoutToggleKey().withColumnSpan(2),
+            SoftwareKeySpec
+                .enabled("touch.text.space", "space", SemanticInput.text(" "))
+                .withColumnSpan(10),
+            key2(letterPeriodKey()),
+            enterKey().withColumnSpan(3)
+        ));
+        return KeyboardLayout.of(KeyboardLayoutId.EN_QWERTY, shifted, SAMSUNG_COLUMNS, rows,
+            SAMSUNG_ROW_WEIGHTS).withVerticalGapDp(SAMSUNG_VERTICAL_GAP_DP).withColumnsPerKey(2);
+    }
+
+    /** The original ten-column English layout, kept for the five-row preview page. */
+    private static KeyboardLayout englishClassic(boolean shifted) {
         List<List<SoftwareKeySpec>> rows = new ArrayList<>(3);
         rows.add(KeyboardLayout.row(
             letter("q", shifted), letter("w", shifted), letter("e", shifted),

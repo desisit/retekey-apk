@@ -161,6 +161,7 @@ public final class ReteKeyboardView extends View {
     private static final float KEY_SHADOW_DP = 2.0f;
 
     /** {@link #KEY_GAP_DP} resolved to pixels for this display; set in the constructor. */
+    private final float density;
     private final int keyGapPx;
     /** How far a finger may wander before it is judged to have left its key. */
     private final int touchSlopPx;
@@ -243,7 +244,7 @@ public final class ReteKeyboardView extends View {
     public ReteKeyboardView(Context context, InputSink sink) {
         super(context);
         this.sink = Objects.requireNonNull(sink, "sink");
-        float density = context.getResources().getDisplayMetrics().density;
+        this.density = context.getResources().getDisplayMetrics().density;
         this.keyGapPx = Math.round(KEY_GAP_DP * density);
         this.touchSlopPx = ViewConfiguration.get(context).getScaledTouchSlop();
         this.flickDistancePx = Math.max(touchSlopPx, Math.round(FLICK_DP * density));
@@ -469,6 +470,15 @@ public final class ReteKeyboardView extends View {
         }
     }
 
+    /** Space above and below each key face: the layout's own, or the usual 2dp. */
+    private int gapPx() {
+        KeyboardLayout current = layout();
+        if (current == null || current.verticalGapDp() == KeyboardLayout.DEFAULT_VERTICAL_GAP_DP) {
+            return keyGapPx;
+        }
+        return Math.round(current.verticalGapDp() * density);
+    }
+
     /** Left/right visual edges for the width slider. Hit testing still uses the full cell. */
     private float keyLeft(float left, float right) {
         float inset = (right - left) * (100 - keyWidthPercent) / 200.0f;
@@ -671,7 +681,7 @@ public final class ReteKeyboardView extends View {
                 int right = layout.columnEdge(startColumn + key.columnSpan(), width);
                 // Cut each key face out of the wash; what is left is exactly the gaps.
                 Compat.clipOut(canvas,
-                    keyLeft(left, right), top + keyGapPx, keyRight(left, right), bottom - keyGapPx);
+                    keyLeft(left, right), top + gapPx(), keyRight(left, right), bottom - gapPx());
             }
         }
         canvas.drawRect(0.0f, 0.0f, width, height, paint);
@@ -821,8 +831,9 @@ public final class ReteKeyboardView extends View {
             float cellBottom = layout.rowEdge(picker.stripRow + 1, height);
             for (int index = 0; index < picker.count && index < candidates.size(); index++) {
                 int column = picker.columnOf(index);
-                float cellLeft = layout.columnEdge(column, width);
-                float cellRight = layout.columnEdge(column + 1, width);
+                int unit = layout.columnsPerKey();
+                float cellLeft = layout.columnEdge(column * unit, width);
+                float cellRight = layout.columnEdge((column + 1) * unit, width);
                 float box = Math.min(cellRight - cellLeft, cellBottom - cellTop) * 0.92f;
                 drawGuideCell(canvas, (cellLeft + cellRight) * 0.5f, (cellTop + cellBottom) * 0.5f,
                     box, candidates.get(index), index == touch.pickerIndex);
@@ -897,6 +908,9 @@ public final class ReteKeyboardView extends View {
                 int startColumn = layout.startColumn(rowIndex, keyIndex);
                 int left = layout.columnEdge(startColumn, width);
                 int right = layout.columnEdge(startColumn + key.columnSpan(), width);
+                if (key.isSpacer()) {
+                    continue;
+                }
                 drawKey(cache, key, left, top, right, bottom);
             }
         }
@@ -1009,9 +1023,9 @@ public final class ReteKeyboardView extends View {
     private void drawKey(Canvas canvas, SoftwareKeySpec key,
             int left, int top, int right, int bottom, int fill) {
         float l = keyLeft(left, right);
-        float t = top + keyGapPx;
+        float t = top + gapPx();
         float r = keyRight(left, right);
-        float b = bottom - keyGapPx;
+        float b = bottom - gapPx();
         drawKeyShape(canvas, l, t, r, b, keyRadiusPx, fill);
         // The ink follows the fill, not the theme: a held key is painted strongly enough that the
         // ordinary label colour would sink into it.
@@ -1491,14 +1505,15 @@ public final class ReteKeyboardView extends View {
         performClick();
     }
 
-    /** The grid column under {@code x}, clamped to the keyboard. */
+    /** The picker cell (one key wide) under {@code x}, clamped to the keyboard. */
     private int columnAt(KeyboardLayout layout, float x) {
         int width = getWidth();
         if (width <= 0) {
             return 0;
         }
-        int column = (int) Math.floor(x / width * layout.columns());
-        return Math.max(0, Math.min(layout.columns() - 1, column));
+        int cells = layout.columns() / layout.columnsPerKey();
+        int column = (int) Math.floor(x / width * cells);
+        return Math.max(0, Math.min(cells - 1, column));
     }
 
     /** Whether a finger has left its key's cell by more than a touch slop. */
@@ -1886,8 +1901,10 @@ public final class ReteKeyboardView extends View {
             // Several alternates: raise the strip and wait. Lift without moving and the first is
             // what you meant; slide along the strip and lift, and that one is.
             KeyboardLayout layout = layout();
-            touch.picker = HoldPicker.place(layout.columns(), touch.row,
-                layout.startColumn(touch.row, touch.key), key.columnSpan(),
+            int unit = layout.columnsPerKey();
+            touch.picker = HoldPicker.place(layout.columns() / unit, touch.row,
+                layout.startColumn(touch.row, touch.key) / unit,
+                Math.max(1, key.columnSpan() / unit),
                 key.longPressTexts().size());
             touch.pickerIndex = 0;
             touch.pickerMoved = false;
@@ -2151,8 +2168,10 @@ public final class ReteKeyboardView extends View {
                 KeyboardLayout layout = layout();
                 SoftwareKeySpec key = layout.rows().get(row).get(keyIndex);
                 Touch pretend = new Touch(-1, row, keyIndex, gridSignature(), 0f, 0f);
-                pretend.picker = HoldPicker.place(layout.columns(), row,
-                    layout.startColumn(row, keyIndex), key.columnSpan(), candidates.size());
+                int unit = layout.columnsPerKey();
+                pretend.picker = HoldPicker.place(layout.columns() / unit, row,
+                    layout.startColumn(row, keyIndex) / unit,
+                    Math.max(1, key.columnSpan() / unit), candidates.size());
                 pretend.pickerPreview = candidates;
                 pretend.pickerIndex = parts.length > 5 ? Integer.parseInt(parts[5]) : 0;
                 touches.put(-1, pretend);
@@ -2227,8 +2246,7 @@ public final class ReteKeyboardView extends View {
         if (height <= 0 || y < 0.0f || y >= height) {
             return -1;
         }
-        int rows = layout.rows().size();
-        return Math.min(rows - 1, (int) (y * rows / height));
+        return layout.rowAt(y, height);
     }
 
     private int keyIndexAt(KeyboardLayout layout, int rowIndex, float x) {

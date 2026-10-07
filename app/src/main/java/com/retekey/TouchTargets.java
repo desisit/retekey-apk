@@ -59,7 +59,7 @@ final class TouchTargets {
             return null;
         }
         int rows = layout.rows().size();
-        int row = Math.min(rows - 1, (int) (y * rows / height));
+        int row = layout.rowAt(y, height);
         int key = keyIndex(layout, row, x, width);
         SoftwareKeySpec hit = layout.rows().get(row).get(key);
         if (!isCostly(hit)) {

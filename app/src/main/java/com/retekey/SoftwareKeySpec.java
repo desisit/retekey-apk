@@ -308,6 +308,11 @@ public final class SoftwareKeySpec {
         return label;
     }
 
+    /** An empty stretch that only pushes its row's keys over; it has no face and takes no touch. */
+    public boolean isSpacer() {
+        return stableKeyId.startsWith("touch.gap.edge");
+    }
+
     public int columnSpan() {
         return columnSpan;
     }
